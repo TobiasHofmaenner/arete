@@ -10,10 +10,9 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
-# But DO track the kubebuilder-generated Helm chart
-!dist/chart/
-!dist/chart/**
+# (dist/ NOT excluded — kubebuilder helm plugin generates dist/chart/
+#  which we track. If Python build artifacts ever appear here, they'll
+#  need explicit per-file exclusion.)
 downloads/
 eggs/
 .eggs/
