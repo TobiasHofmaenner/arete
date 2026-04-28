@@ -8,6 +8,14 @@ metadata:
   name: arete-manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - arete.arete.io
   resources:
   - backuprepositories

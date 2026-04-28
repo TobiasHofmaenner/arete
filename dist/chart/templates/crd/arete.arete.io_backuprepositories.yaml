@@ -33,6 +33,10 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="Healthy")].status
       name: Healthy
       type: string
+    - jsonPath: .status.detectedVersion
+      name: Detected
+      priority: 1
+      type: string
     - jsonPath: .status.inventory.objectCount
       name: Objects
       type: integer
@@ -219,6 +223,19 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              detectedFormat:
+                description: |-
+                  detectedFormat is the on-disk format inferred from sentinel files in
+                  the repository (e.g. parsed from a wal-g backup_stop_sentinel.json or
+                  a restic config). Informational only — the validator binary is always
+                  arete's pinned latest, never selected by detected version.
+                type: string
+              detectedVersion:
+                description: |-
+                  detectedVersion is the producer tool version that wrote the sentinel
+                  (e.g. "wal-g 2.0.1"). Informational; surfaces forward-compat skew when
+                  arete's pinned validator can no longer parse it.
+                type: string
               inventory:
                 description: inventory summarises the current contents of the repository.
                 properties:

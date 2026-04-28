@@ -152,6 +152,19 @@ type BackupRepositoryStatus struct {
 	// +optional
 	LastValidatedAt *metav1.Time `json:"lastValidatedAt,omitempty"`
 
+	// detectedFormat is the on-disk format inferred from sentinel files in
+	// the repository (e.g. parsed from a wal-g backup_stop_sentinel.json or
+	// a restic config). Informational only — the validator binary is always
+	// arete's pinned latest, never selected by detected version.
+	// +optional
+	DetectedFormat string `json:"detectedFormat,omitempty"`
+
+	// detectedVersion is the producer tool version that wrote the sentinel
+	// (e.g. "wal-g 2.0.1"). Informational; surfaces forward-compat skew when
+	// arete's pinned validator can no longer parse it.
+	// +optional
+	DetectedVersion string `json:"detectedVersion,omitempty"`
+
 	// inventory summarises the current contents of the repository.
 	// +optional
 	Inventory *InventoryStatus `json:"inventory,omitempty"`
@@ -163,6 +176,7 @@ type BackupRepositoryStatus struct {
 // +kubebuilder:printcolumn:name="Format",type=string,JSONPath=`.spec.format`
 // +kubebuilder:printcolumn:name="Reachable",type=string,JSONPath=`.status.conditions[?(@.type=="Reachable")].status`
 // +kubebuilder:printcolumn:name="Healthy",type=string,JSONPath=`.status.conditions[?(@.type=="Healthy")].status`
+// +kubebuilder:printcolumn:name="Detected",type=string,priority=1,JSONPath=`.status.detectedVersion`
 // +kubebuilder:printcolumn:name="Objects",type=integer,JSONPath=`.status.inventory.objectCount`
 // +kubebuilder:printcolumn:name="Last Probed",type=date,JSONPath=`.status.lastProbedAt`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
