@@ -12,8 +12,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/arete
-  CHART_REPO: ghcr.io/${{ github.repository_owner }}/charts
+  # GHCR paths must be lowercase; github.repository_owner preserves case
+  IMAGE_REPO: ghcr.io/tobiashofmaenner/arete
+  CHART_REPO: ghcr.io/tobiashofmaenner/charts
 
 jobs:
   image:
