@@ -377,10 +377,14 @@ type resticConfig struct {
 	ID      string `json:"id"`
 }
 
+// readResticConfig parses <prefix>/config to surface the restic repo format
+// version. claimedLatestBackup stays nil for restic at E1 — restic snapshot
+// enumeration requires decrypting the snapshots/ index, which is E2's job.
+//
+//nolint:unparam // second return reserved for E2 to populate latestBackup
 func readResticConfig(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
 ) (string, *aretev1alpha1.LatestBackupStatus) {
-	// restic config lives at a fixed key relative to the repo prefix.
 	body, err := getObjectBody(ctx, client, spec.S3.Bucket, spec.S3.Prefix+"/config")
 	if err != nil {
 		return "", nil
@@ -389,10 +393,6 @@ func readResticConfig(
 	if err := json.Unmarshal(body, &c); err != nil {
 		return "", nil
 	}
-	// Restic snapshot enumeration to find the latest backup is non-trivial
-	// (snapshots/* index needs decryption). Defer to E2 — for now we only
-	// surface the repo format version. claimedLatestBackup stays nil for
-	// restic until E2 ships and can populate it via `restic snapshots`.
 	return fmt.Sprintf("repo-v%d", c.Version), nil
 }
 

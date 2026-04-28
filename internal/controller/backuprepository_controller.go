@@ -324,10 +324,10 @@ func removeCondition(cs *[]metav1.Condition, condType string) {
 //   - Unknown if any present condition is Unknown (and none is False)
 //   - True if all present conditions are True
 //   - Unknown if no condition of any of the requested types is present
-func rollupAND(cs []metav1.Condition, types ...string) metav1.Condition {
+func rollupAND(cs []metav1.Condition, condTypes ...string) metav1.Condition {
 	var anyFalse, anyUnknown, anyTrue bool
 	var falseMsg, unknownMsg string
-	for _, t := range types {
+	for _, t := range condTypes {
 		c := apimeta.FindStatusCondition(cs, t)
 		if c == nil {
 			continue
