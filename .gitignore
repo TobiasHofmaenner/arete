@@ -11,6 +11,9 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+# But DO track the kubebuilder-generated Helm chart
+!dist/chart/
+!dist/chart/**
 downloads/
 eggs/
 .eggs/
