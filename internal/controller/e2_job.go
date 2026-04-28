@@ -194,7 +194,7 @@ const jobActiveDeadline = 10 * time.Minute
 // previous Job that may still be in TTL grace.
 func e2JobName(br *aretev1alpha1.BackupRepository) string {
 	now := time.Now().UTC().Format("20060102-1504")
-	hash := sha256.Sum256([]byte(fmt.Sprintf("%s-%d-%s", br.Name, br.Generation, now)))
+	hash := sha256.Sum256(fmt.Appendf(nil, "%s-%d-%s", br.Name, br.Generation, now))
 	short := hex.EncodeToString(hash[:4])
 	// Job name max 52 chars (k8s limit minus pod-name suffix headroom).
 	base := fmt.Sprintf("arete-e2-%s", br.Name)
