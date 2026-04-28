@@ -100,8 +100,9 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 // completed Job (if newer than verifiedLastValidationAt).
 type e2Outcome struct {
 	jobActive       bool
-	completedResult *metav1.Condition // nil if no new completed job to process
-	completedAt     *time.Time        // nil if completedResult is nil
+	completedResult *metav1.Condition                 // nil if no new completed job to process
+	completedAt     *time.Time                        // nil if completedResult is nil
+	latestBackup    *aretev1alpha1.LatestBackupStatus // nil if validator didn't emit JSON or parse failed
 }
 
 // processE2 inspects existing E2 Jobs for this BR, ingests results from
@@ -128,9 +129,10 @@ func (r *BackupRepositoryReconciler) processE2(
 		alreadyIngested := br.Status.VerifiedLastValidationAt != nil &&
 			!completedAt.After(br.Status.VerifiedLastValidationAt.Time)
 		if !alreadyIngested {
-			cond := r.buildMetadataValidCondition(ctx, latest)
+			cond, latestBackup := r.ingestE2Result(ctx, br, latest)
 			out.completedResult = cond
 			out.completedAt = &completedAt
+			out.latestBackup = latestBackup
 		}
 	}
 
@@ -147,23 +149,25 @@ func (r *BackupRepositoryReconciler) processE2(
 	return out
 }
 
-// buildMetadataValidCondition turns a finished Job into a MetadataValid
-// condition (True if exit 0, False otherwise) with the last 20 lines of
-// pod logs as the message for diagnostic value.
-func (r *BackupRepositoryReconciler) buildMetadataValidCondition(
-	ctx context.Context, job *batchv1.Job,
-) *metav1.Condition {
+// ingestE2Result turns a finished Job into a (MetadataValid condition,
+// claimedLatestBackup struct). The condition reflects exit code; the
+// LatestBackup is parsed from the validator's JSON output if present.
+// On failure, both reflect the diagnostic last log line.
+func (r *BackupRepositoryReconciler) ingestE2Result(
+	ctx context.Context, br *aretev1alpha1.BackupRepository, job *batchv1.Job,
+) (*metav1.Condition, *aretev1alpha1.LatestBackupStatus) {
 	logs := r.readJobOutput(ctx, job)
-	if jobSucceeded(job) {
-		return condTrue(
-			aretev1alpha1.ReasonProbeSucceeded,
-			fmt.Sprintf("validator exit 0; last log: %s", lastLine(logs)),
-		)
+	if !jobSucceeded(job) {
+		return condFalse(
+			aretev1alpha1.ReasonMetadataValidationFailed,
+			fmt.Sprintf("validator failed; last log: %s", lastLine(logs)),
+		), nil
 	}
-	return condFalse(
-		aretev1alpha1.ReasonMetadataValidationFailed,
-		fmt.Sprintf("validator failed; last log: %s", lastLine(logs)),
-	)
+	latestBackup := parseE2Output(br.Spec.Format, logs)
+	return condTrue(
+		aretev1alpha1.ReasonProbeSucceeded,
+		fmt.Sprintf("validator exit 0; last log: %s", lastLine(logs)),
+	), latestBackup
 }
 
 // lastLine extracts the last non-empty line from multi-line output.
@@ -251,13 +255,9 @@ func (r *BackupRepositoryReconciler) applyStatus(
 	br.Status.ObservedGeneration = br.Generation
 	br.Status.DetectedFormat = p.DetectedFormat
 	br.Status.DetectedVersion = p.DetectedVersion
-	br.Status.ClaimedLatestBackup = p.LatestBackup
-	if p.LatestBackup != nil {
-		ts := p.LatestBackup.CreatedAt
-		br.Status.ClaimedLastSuccessfulBackup = &ts
-	} else {
-		br.Status.ClaimedLastSuccessfulBackup = nil
-	}
+	// E1 owns claimedLastSuccessfulBackup (the timestamp). claimedLatestBackup
+	// (full per-backup detail) is owned by E2 — see ingestion below.
+	br.Status.ClaimedLastSuccessfulBackup = p.LastSuccessfulBackup
 
 	// Ingest any newly-completed E2 result into status.
 	var metadataValid *metav1.Condition
@@ -265,6 +265,10 @@ func (r *BackupRepositoryReconciler) applyStatus(
 		metadataValid = e2.completedResult
 		t := metav1.NewTime(*e2.completedAt)
 		br.Status.VerifiedLastValidationAt = &t
+		// claimedLatestBackup is overwritten with E2's view (or cleared
+		// to nil if E2 didn't produce one) so its recency is always the
+		// E2 cadence, never a stale mix of E1 and E2 data.
+		br.Status.ClaimedLatestBackup = e2.latestBackup
 	} else if br.Status.VerifiedLastValidationAt != nil {
 		// No new result this cycle — preserve previous condition.
 		if existing := apimeta.FindStatusCondition(br.Status.Conditions,

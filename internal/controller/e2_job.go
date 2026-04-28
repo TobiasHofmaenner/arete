@@ -157,6 +157,7 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 	if err != nil {
 		return nil, err
 	}
+	cmd := e2CommandFor(br.Spec.Format)
 	args := e2ArgsFor(br.Spec.Format)
 
 	job := &batchv1.Job{
@@ -179,6 +180,7 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 					Containers: []corev1.Container{{
 						Name:            "validator",
 						Image:           image,
+						Command:         cmd,
 						Args:            args,
 						SecurityContext: restrictedContainerSecurityContext(),
 						EnvFrom: []corev1.EnvFromSource{{
@@ -290,23 +292,45 @@ func (r *BackupRepositoryReconciler) validatorImageFor(format aretev1alpha1.Back
 // e2ArgsFor returns the args passed to the validator image's ENTRYPOINT
 // for E2 validation. Both wal-g and restic images have the format binary
 // as their ENTRYPOINT, so we only need to supply the subcommand + flags.
+//
+// Each command emits structured JSON for the most-recent backup detail
+// — the controller parses it on Job completion and populates
+// claimedLatestBackup. See e2_output.go for the parsers.
 func e2ArgsFor(format aretev1alpha1.BackupFormat) []string {
 	switch format {
 	case aretev1alpha1.BackupFormatWalg:
-		// E2 = metadata-only check. `wal-g backup-list` enumerates the
-		// backup catalog using S3 reads alone — proves the catalog is
-		// readable, decryptable, and well-formed.
+		// E2 = metadata + per-backup detail. backup-list --detail --json
+		// enumerates the catalog AND emits per-backup struct (size,
+		// timestamps, name) the controller parses for claimedLatestBackup.
 		//
 		// `wal-g wal-verify integrity/timeline` intentionally NOT here:
-		// those subcommands require a live Postgres connection to query
-		// the current LSN/timeline, which arete doesn't have. Deeper
-		// WAL chain checks belong in E3 (sampled retrieval) and L2
-		// (the dr drill).
-		return []string{"backup-list"}
+		// those subcommands require a live Postgres connection (current
+		// LSN/timeline). Deeper WAL chain checks belong in E3 + L2.
+		return []string{"backup-list", "--detail", "--json"}
 	case aretev1alpha1.BackupFormatRestic:
-		// Relies on env vars (RESTIC_REPOSITORY, RESTIC_PASSWORD) from
-		// the credentialsSecret.
-		return []string{"check"}
+		// `restic check` validates index/data integrity (returns exit 0
+		// on success). Then `restic snapshots --json` emits the snapshot
+		// list with per-snapshot summary.* including total_bytes_processed
+		// + data_added_packed for size info.
+		// Override ENTRYPOINT (sh) so we can chain.
+		return nil // populated via Command override; see e2CommandFor below
+	}
+	return nil
+}
+
+// e2CommandFor returns the command override (in addition to args) for
+// formats whose E2 needs to chain multiple binary invocations. Returns
+// nil/empty for formats that work with the image ENTRYPOINT alone.
+func e2CommandFor(format aretev1alpha1.BackupFormat) []string {
+	switch format {
+	case aretev1alpha1.BackupFormatRestic:
+		// restic image ENTRYPOINT is `restic`; we need to override with
+		// a shell to chain check + snapshots --json.
+		// Setting RESTIC_CACHE_DIR=/tmp because the image's nonroot
+		// user has no writable home for the default cache location.
+		return []string{"sh", "-c",
+			"export RESTIC_CACHE_DIR=/tmp && " +
+				"restic check && restic snapshots --json"}
 	}
 	return nil
 }
