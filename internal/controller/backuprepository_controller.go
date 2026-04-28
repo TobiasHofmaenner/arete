@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
@@ -556,14 +557,23 @@ func (r *BackupRepositoryReconciler) mapSecretToRepositories(
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// Reconcile triggers:
+//   - For()    — spec changes only (GenerationChangedPredicate). Without
+//     this filter, every status patch we make would re-trigger
+//     Reconcile, producing a tight self-feeding loop because
+//     LastProbedAt updates on every cycle.
+//   - Owns()   — Job state changes (created/scheduled/complete/deleted).
+//   - Watches()— Secret create/update/delete via mapSecretToRepositories.
+//   - Periodic — Result{RequeueAfter: probeInterval} from each Reconcile.
 func (r *BackupRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&aretev1alpha1.BackupRepository{}).
+		For(&aretev1alpha1.BackupRepository{},
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&batchv1.Job{}).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.mapSecretToRepositories),
-			builder.WithPredicates(),
 		).
 		Named("backuprepository").
 		Complete(r)
