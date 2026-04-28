@@ -31,7 +31,14 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         libsodium23 && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    # wal-g calls user.Lookup() at startup and crashes if the running UID
+    # has no /etc/passwd entry. arete spawns validator pods with
+    # runAsUser=65532 (PSS-restricted compliance), so we provision a
+    # matching nonroot account here. Group/home-dir match common K8s
+    # convention (distroless nonroot user).
+    groupadd --gid 65532 nonroot && \
+    useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
 COPY --from=download /tmp/wal-g /usr/local/bin/wal-g
 
 # Embed version metadata so `docker inspect` (and the controller, if it ever
