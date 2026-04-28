@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- arete_v1alpha1_backuprepository.yaml
+- arete_v1alpha1_conditionalconfig.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

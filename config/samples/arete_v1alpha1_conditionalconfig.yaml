@@ -1,0 +1,9 @@
+apiVersion: arete.arete.io/v1alpha1
+kind: ConditionalConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: arete
+    app.kubernetes.io/managed-by: kustomize
+  name: conditionalconfig-sample
+spec:
+  # TODO(user): Add fields here

@@ -216,3 +216,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# === Go ===
+# Build output
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Test artifacts
+*.test
+*.out
+cover.out
+# Vendored deps
+vendor/
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*~
