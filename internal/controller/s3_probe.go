@@ -57,6 +57,12 @@ type probeResult struct {
 
 // probeRepository runs one Layer-1 probe against the configured repository.
 // Pure function over (spec, creds) — no Kubernetes side effects.
+//
+// Two phases:
+//  1. Cheap reachability LIST under spec.prefix (caps at probeReachabilityCap).
+//  2. Format-aware sentinel hunt for detectedFormat/detectedVersion.
+//
+// Phase 2 is best-effort; failure to find a sentinel does NOT flip Reachable.
 func probeRepository(
 	ctx context.Context, spec aretev1alpha1.BackupRepositorySpec, creds S3Credentials,
 ) probeResult {
@@ -69,23 +75,24 @@ func probeRepository(
 		}
 	}
 
-	// Bounded LIST under the prefix — confirms creds + auth + reachability
-	// in one call. Capped at sampleLimit so a giant repo doesn't tax us.
-	const sampleLimit = 50
+	// Phase 1: reachability. Non-recursive LIST is enough — we only need to
+	// confirm creds + auth + that the prefix is queryable. Empty prefix is
+	// still Reachable=True (Healthy will reject it in Pass 3).
+	const probeReachabilityCap = 10
 	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	var sample []minio.ObjectInfo
+	count := 0
 	for obj := range client.ListObjects(listCtx, spec.S3.Bucket, minio.ListObjectsOptions{
 		Prefix:    spec.S3.Prefix + "/",
-		Recursive: true,
+		Recursive: false,
 	}) {
 		if obj.Err != nil {
 			reason, msg := classifyS3Error(obj.Err)
 			return probeResult{Reachable: false, Reason: reason, Message: msg}
 		}
-		sample = append(sample, obj)
-		if len(sample) >= sampleLimit {
+		count++
+		if count >= probeReachabilityCap {
 			break
 		}
 	}
@@ -93,14 +100,11 @@ func probeRepository(
 	result := probeResult{
 		Reachable: true,
 		Reason:    "ProbeSucceeded",
-		Message:   fmt.Sprintf("listed %d objects under prefix", len(sample)),
+		Message:   fmt.Sprintf("prefix reachable, %d top-level entries sampled", count),
 	}
 
-	// Best-effort sentinel detection. Failure to find a sentinel does NOT
-	// flip Reachable — the bucket+prefix were demonstrably reachable. Empty
-	// or unrecognised content just leaves DetectedVersion blank for now;
-	// Layer-2 will ultimately decide Healthy.
-	format, version := detectFormatVersion(ctx, client, spec, sample)
+	// Phase 2: format-aware sentinel hunt.
+	format, version := detectFormatVersion(ctx, client, spec)
 	result.DetectedFormat = format
 	result.DetectedVersion = version
 	return result
@@ -143,18 +147,17 @@ func classifyS3Error(err error) (string, string) {
 	return "S3Unreachable", err.Error()
 }
 
-// detectFormatVersion inspects the listed sample for a format-specific
-// sentinel matching spec.format and parses the producer version out of it.
-// Best-effort; returns ("", "") if no sentinel is found or parsing fails.
+// detectFormatVersion does a format-specific targeted lookup for the
+// producer version. Best-effort; returns ("", "") if the sentinel is
+// missing or unparseable.
 func detectFormatVersion(
-	ctx context.Context, client *minio.Client,
-	spec aretev1alpha1.BackupRepositorySpec, sample []minio.ObjectInfo,
+	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
 ) (string, string) {
 	switch spec.Format {
 	case aretev1alpha1.BackupFormatWalg:
-		return "walg", detectWalgVersion(ctx, client, spec, sample)
+		return "walg", detectWalgVersion(ctx, client, spec)
 	case aretev1alpha1.BackupFormatRestic:
-		return "restic", detectResticVersion(ctx, client, spec, sample)
+		return "restic", detectResticVersion(ctx, client, spec)
 	case aretev1alpha1.BackupFormatBarman:
 		// Barman sentinel parsing not implemented in Pass 2 — format is
 		// reported but version stays empty.
@@ -172,24 +175,34 @@ type walgSentinel struct {
 }
 
 func detectWalgVersion(
-	ctx context.Context, client *minio.Client,
-	spec aretev1alpha1.BackupRepositorySpec, sample []minio.ObjectInfo,
+	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
 ) string {
 	const suffix = "_backup_stop_sentinel.json"
 
-	// Collect all sentinel keys in the sample, pick the most recent by
-	// LastModified. wal-g writes a new sentinel per basebackup; the latest
-	// reflects the version that wrote the most recent backup — which is
-	// what we want to compare against arete's pinned validator.
+	// wal-g writes one sentinel per basebackup, all under
+	// `<prefix>/basebackups_005/`. List that subdir non-recursively to skip
+	// the per-backup tar_partitions noise — sentinels live at the top of
+	// the basebackups dir alongside the per-backup subdirs.
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	var sentinels []minio.ObjectInfo
-	for _, o := range sample {
-		if strings.HasSuffix(o.Key, suffix) {
-			sentinels = append(sentinels, o)
+	for obj := range client.ListObjects(listCtx, spec.S3.Bucket, minio.ListObjectsOptions{
+		Prefix:    spec.S3.Prefix + "/basebackups_005/",
+		Recursive: false,
+	}) {
+		if obj.Err != nil {
+			return ""
+		}
+		if strings.HasSuffix(obj.Key, suffix) {
+			sentinels = append(sentinels, obj)
 		}
 	}
 	if len(sentinels) == 0 {
 		return ""
 	}
+	// Pick the most recent sentinel — reflects the version that wrote the
+	// latest backup, which is what we want to compare to arete's validator.
 	sort.Slice(sentinels, func(i, j int) bool {
 		return sentinels[i].LastModified.After(sentinels[j].LastModified)
 	})
@@ -217,21 +230,11 @@ type resticConfig struct {
 }
 
 func detectResticVersion(
-	ctx context.Context, client *minio.Client,
-	spec aretev1alpha1.BackupRepositorySpec, sample []minio.ObjectInfo,
+	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
 ) string {
-	configKey := spec.S3.Prefix + "/config"
-	hasConfig := false
-	for _, o := range sample {
-		if o.Key == configKey {
-			hasConfig = true
-			break
-		}
-	}
-	if !hasConfig {
-		return ""
-	}
-	body, err := getObjectBody(ctx, client, spec.S3.Bucket, configKey)
+	// restic config lives at a fixed key relative to the repo prefix.
+	// GET it directly — no need to list first.
+	body, err := getObjectBody(ctx, client, spec.S3.Bucket, spec.S3.Prefix+"/config")
 	if err != nil {
 		return ""
 	}
