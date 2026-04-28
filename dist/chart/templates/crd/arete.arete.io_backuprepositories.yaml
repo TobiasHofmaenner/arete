@@ -17,13 +17,37 @@ spec:
     kind: BackupRepository
     listKind: BackupRepositoryList
     plural: backuprepositories
+    shortNames:
+    - backuprepo
+    - br
     singular: backuprepository
-  scope: Namespaced
+  scope: Cluster
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.format
+      name: Format
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Reachable")].status
+      name: Reachable
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Healthy")].status
+      name: Healthy
+      type: string
+    - jsonPath: .status.inventory.objectCount
+      name: Objects
+      type: integer
+    - jsonPath: .status.lastProbedAt
+      name: Last Probed
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: BackupRepository is the Schema for the backuprepositories API
+        description: |-
+          BackupRepository declares an S3-backed backup location to be continuously
+          probed (Layer 1) and format-validated (Layer 2) by the arete operator.
         properties:
           apiVersion:
             description: |-
@@ -43,27 +67,100 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of BackupRepository
+            description: |-
+              BackupRepositorySpec defines the desired state of BackupRepository.
+
+              All fields are required by design — arete enforces a strict contract
+              (see ADR-023). There are no optional best-practice fields, no opt-out
+              flags, and no escape hatches. If a CR exists, the contract is in force.
             properties:
-              foo:
-                description: foo is an example field of BackupRepository. Edit backuprepository_types.go
-                  to remove/update
+              format:
+                description: |-
+                  format is the on-disk layout of the repository. Required — auto-detection
+                  is intentionally not offered (declaring intent is part of the contract).
+                enum:
+                - walg
+                - restic
+                - barman
                 type: string
+              probeInterval:
+                description: |-
+                  probeInterval is how often Layer-1 (format-agnostic S3 reachability)
+                  is checked. Bounded to [1m, 1h] — values outside this range render the
+                  contract meaningless and are rejected.
+                type: string
+                x-kubernetes-validations:
+                - message: probeInterval must be between 1m and 1h
+                  rule: duration(self) >= duration('1m') && duration(self) <= duration('1h')
+              s3:
+                description: s3 is the location of the repository.
+                properties:
+                  bucket:
+                    description: bucket is the S3 bucket name.
+                    maxLength: 63
+                    minLength: 3
+                    type: string
+                  credentialsSecret:
+                    description: |-
+                      credentialsSecret references a Secret containing AWS_ACCESS_KEY_ID
+                      and AWS_SECRET_ACCESS_KEY keys. Cluster-scoped CR requires namespace.
+                    properties:
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                  endpoint:
+                    description: |-
+                      endpoint is the S3 API URL (e.g., https://s3.eu-central-1.amazonaws.com,
+                      or a MinIO endpoint). Must include scheme.
+                    pattern: ^https?://.+
+                    type: string
+                  prefix:
+                    description: |-
+                      prefix is the key prefix that scopes this repository within the bucket.
+                      Must NOT start or end with "/".
+                    minLength: 1
+                    pattern: ^[^/].*[^/]$|^[^/]$
+                    type: string
+                  region:
+                    description: region is the S3 region.
+                    minLength: 1
+                    type: string
+                required:
+                - bucket
+                - credentialsSecret
+                - endpoint
+                - prefix
+                - region
+                type: object
+              validationInterval:
+                description: |-
+                  validationInterval is how often Layer-2 (format-aware) validation runs
+                  (e.g. wal-g backup-list, restic check). Bounded to [1h, 24h].
+                type: string
+                x-kubernetes-validations:
+                - message: validationInterval must be between 1h and 24h
+                  rule: duration(self) >= duration('1h') && duration(self) <= duration('24h')
+            required:
+            - format
+            - probeInterval
+            - s3
+            - validationInterval
             type: object
           status:
-            description: status defines the observed state of BackupRepository
+            description: BackupRepositoryStatus defines the observed state of BackupRepository.
             properties:
               conditions:
                 description: |-
-                  conditions represent the current state of the BackupRepository resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                  conditions reflect the current state of the repository.
+                  Only Reachable and Healthy are emitted; both are binary (True | False
+                  | Unknown). No Warning tier — see ADR-023 strict-contract rule.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -122,6 +219,47 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              inventory:
+                description: inventory summarises the current contents of the repository.
+                properties:
+                  newestObject:
+                    description: newestObject is the LastModified of the latest object.
+                    format: date-time
+                    type: string
+                  objectCount:
+                    description: objectCount is the total number of S3 objects under
+                      spec.s3.prefix.
+                    format: int64
+                    type: integer
+                  oldestObject:
+                    description: oldestObject is the LastModified of the earliest
+                      object.
+                    format: date-time
+                    type: string
+                  totalBytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: totalBytes is the cumulative size of all objects.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                required:
+                - objectCount
+                - totalBytes
+                type: object
+              lastProbedAt:
+                description: lastProbedAt is when the most recent Layer-1 probe completed.
+                format: date-time
+                type: string
+              lastValidatedAt:
+                description: lastValidatedAt is when the most recent Layer-2 validation
+                  completed.
+                format: date-time
+                type: string
+              observedGeneration:
+                description: observedGeneration is the .metadata.generation last reconciled.
+                format: int64
+                type: integer
             type: object
         required:
         - spec
