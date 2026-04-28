@@ -294,11 +294,11 @@ func e2CommandFor(format aretev1alpha1.BackupFormat) ([]string, []string) {
 	switch format {
 	case aretev1alpha1.BackupFormatWalg:
 		// wal-g validator image entrypoint is `wal-g`. Override with a
-		// shell so we can chain backup-list + wal-verify in one Job.
+		// POSIX-sh chain so we can run backup-list + wal-verify in one Job.
+		// (ubuntu:22.04's /bin/sh is dash — no `set -o pipefail`. The &&
+		// already short-circuits on failure.)
 		return []string{"sh", "-c"}, []string{
-			"set -eo pipefail; " +
-				"wal-g backup-list && " +
-				"wal-g wal-verify integrity",
+			"wal-g backup-list && wal-g wal-verify integrity",
 		}
 	case aretev1alpha1.BackupFormatRestic:
 		// restic upstream image entrypoint is `restic`. We pass `check`
