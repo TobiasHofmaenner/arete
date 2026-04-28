@@ -244,6 +244,6 @@ func getObjectBody(ctx context.Context, client *s3.Client, bucket, key string) (
 	if err != nil {
 		return nil, err
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 	return io.ReadAll(io.LimitReader(out.Body, maxBytes))
 }
