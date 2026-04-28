@@ -29,6 +29,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
 )
@@ -177,6 +178,7 @@ type walgSentinel struct {
 func detectWalgVersion(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
 ) string {
+	log := logf.FromContext(ctx)
 	const suffix = "_backup_stop_sentinel.json"
 
 	// wal-g writes one sentinel per basebackup, all under
@@ -186,18 +188,25 @@ func detectWalgVersion(
 	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	listPrefix := spec.S3.Prefix + "/basebackups_005/"
+	log.Info("walg sentinel hunt starting", "bucket", spec.S3.Bucket, "prefix", listPrefix)
+
 	var sentinels []minio.ObjectInfo
+	total := 0
 	for obj := range client.ListObjects(listCtx, spec.S3.Bucket, minio.ListObjectsOptions{
-		Prefix:    spec.S3.Prefix + "/basebackups_005/",
+		Prefix:    listPrefix,
 		Recursive: false,
 	}) {
 		if obj.Err != nil {
+			log.Error(obj.Err, "walg sentinel hunt list error")
 			return ""
 		}
+		total++
 		if strings.HasSuffix(obj.Key, suffix) {
 			sentinels = append(sentinels, obj)
 		}
 	}
+	log.Info("walg sentinel hunt finished", "totalObjects", total, "sentinelsFound", len(sentinels))
 	if len(sentinels) == 0 {
 		return ""
 	}
