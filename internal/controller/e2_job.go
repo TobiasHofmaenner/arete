@@ -157,7 +157,7 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 	if err != nil {
 		return nil, err
 	}
-	cmd, args := e2CommandFor(br.Spec.Format)
+	args := e2ArgsFor(br.Spec.Format)
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -179,7 +179,6 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 					Containers: []corev1.Container{{
 						Name:            "validator",
 						Image:           image,
-						Command:         cmd,
 						Args:            args,
 						SecurityContext: restrictedContainerSecurityContext(),
 						EnvFrom: []corev1.EnvFromSource{{
@@ -288,9 +287,10 @@ func (r *BackupRepositoryReconciler) validatorImageFor(format aretev1alpha1.Back
 	return "", fmt.Errorf("unknown format %q", format)
 }
 
-// e2CommandFor returns the (command, args) the Job runs for E2 validation
-// per format.
-func e2CommandFor(format aretev1alpha1.BackupFormat) ([]string, []string) {
+// e2ArgsFor returns the args passed to the validator image's ENTRYPOINT
+// for E2 validation. Both wal-g and restic images have the format binary
+// as their ENTRYPOINT, so we only need to supply the subcommand + flags.
+func e2ArgsFor(format aretev1alpha1.BackupFormat) []string {
 	switch format {
 	case aretev1alpha1.BackupFormatWalg:
 		// E2 = metadata-only check. `wal-g backup-list` enumerates the
@@ -300,16 +300,15 @@ func e2CommandFor(format aretev1alpha1.BackupFormat) ([]string, []string) {
 		// `wal-g wal-verify integrity/timeline` intentionally NOT here:
 		// those subcommands require a live Postgres connection to query
 		// the current LSN/timeline, which arete doesn't have. Deeper
-		// WAL chain checks belong in E3 (sampled retrieval) where we
-		// actually pull WAL segments and verify them against each other.
-		return nil, []string{"backup-list"}
+		// WAL chain checks belong in E3 (sampled retrieval) and L2
+		// (the dr drill).
+		return []string{"backup-list"}
 	case aretev1alpha1.BackupFormatRestic:
-		// restic upstream image entrypoint is `restic`. We pass `check`
-		// and rely on env vars (RESTIC_REPOSITORY, RESTIC_PASSWORD) from
+		// Relies on env vars (RESTIC_REPOSITORY, RESTIC_PASSWORD) from
 		// the credentialsSecret.
-		return nil, []string{"check"}
+		return []string{"check"}
 	}
-	return nil, nil
+	return nil
 }
 
 // e2EnvFor returns the per-spec env vars (paths + region + endpoint) the
