@@ -14,7 +14,11 @@ env:
   REGISTRY: ghcr.io
   # GHCR paths must be lowercase; github.repository_owner preserves case
   IMAGE_REPO: ghcr.io/tobiashofmaenner/arete
+  VALIDATOR_WALG_REPO: ghcr.io/tobiashofmaenner/arete-validator-walg
   CHART_REPO: ghcr.io/tobiashofmaenner/charts
+  # wal-g version pinned per arete release — bump here when arete bumps.
+  # See ADR-023 for the always-latest-pinned strategy + forward-compat canary.
+  WALG_VERSION: '3.0.5'
 
 jobs:
   image:
@@ -61,6 +65,53 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  validator-walg:
+    name: Build + push wal-g validator image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute validator image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.VALIDATOR_WALG_REPO }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build (and push) wal-g validator
+        uses: docker/build-push-action@v5
+        with:
+          context: validators/walg
+          # PRs build but don't push
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            WALG_VERSION=${{ env.WALG_VERSION }}
+          cache-from: type=gha,scope=validator-walg
+          cache-to: type=gha,mode=max,scope=validator-walg
 
   chart:
     name: Package + push chart
