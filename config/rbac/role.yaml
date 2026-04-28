@@ -7,11 +7,18 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - pods
   - secrets
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/log
+  verbs:
+  - get
 - apiGroups:
   - arete.arete.io
   resources:
@@ -41,3 +48,13 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch

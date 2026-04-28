@@ -19,8 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -40,8 +42,7 @@ import (
 // ValidatorImages holds the per-format validator container image
 // references the controller passes to Jobs it spawns for E2-E4. Pinned per
 // arete release via the Helm chart (see ADR-023's always-latest-pinned
-// strategy + forward-compat-canary insight). Populated from env vars by
-// the manager bootstrap; not used yet (Pass 3b-3 wires the Job spawner).
+// strategy + forward-compat-canary insight).
 type ValidatorImages struct {
 	Walg   string
 	Restic string
@@ -52,12 +53,19 @@ type BackupRepositoryReconciler struct {
 	client.Client
 	Scheme          *runtime.Scheme
 	ValidatorImages ValidatorImages
+	// PodLogs streams logs from a pod (injected at startup to keep the
+	// controller package free of client-go imports). Optional; when nil,
+	// MetadataValid messages omit the validator's stderr.
+	PodLogs PodLogStreamer
 }
 
 // +kubebuilder:rbac:groups=arete.arete.io,resources=backuprepositories,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=arete.arete.io,resources=backuprepositories/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=arete.arete.io,resources=backuprepositories/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 
 func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -73,14 +81,105 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return r.recordCredentialsFailure(ctx, &br, err)
 	}
 
-	result := probeRepository(ctx, br.Spec, creds)
+	// E1 probe (in-process; cheap)
+	probe := probeRepository(ctx, br.Spec, creds)
 
-	if err := r.applyStatus(ctx, &br, result); err != nil {
+	// E2 Job lifecycle: process any completed Job, maybe spawn a new one
+	e2 := r.processE2(ctx, &br)
+
+	if err := r.applyStatus(ctx, &br, probe, e2); err != nil {
 		log.Error(err, "failed to update status")
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: br.Spec.ProbeInterval.Duration}, nil
+}
+
+// e2Outcome captures what we learned about E2 this reconcile cycle:
+// whether a Job is currently running, and the result of the most recent
+// completed Job (if newer than verifiedLastValidationAt).
+type e2Outcome struct {
+	jobActive       bool
+	completedResult *metav1.Condition // nil if no new completed job to process
+	completedAt     *time.Time        // nil if completedResult is nil
+}
+
+// processE2 inspects existing E2 Jobs for this BR, ingests results from
+// any newly-completed Job, and spawns a fresh Job when due.
+func (r *BackupRepositoryReconciler) processE2(
+	ctx context.Context, br *aretev1alpha1.BackupRepository,
+) e2Outcome {
+	log := logf.FromContext(ctx)
+	out := e2Outcome{}
+
+	jobs, err := r.listE2Jobs(ctx, br)
+	if err != nil {
+		log.Error(err, "list e2 jobs")
+		return out
+	}
+
+	if active := firstActiveJob(jobs); active != nil {
+		out.jobActive = true
+	}
+
+	// If a completed Job is newer than what we last recorded, ingest it.
+	if latest := pickLatestCompletedJob(jobs); latest != nil {
+		completedAt := jobCompletionTime(latest)
+		alreadyIngested := br.Status.VerifiedLastValidationAt != nil &&
+			!completedAt.After(br.Status.VerifiedLastValidationAt.Time)
+		if !alreadyIngested {
+			cond := r.buildMetadataValidCondition(ctx, latest)
+			out.completedResult = cond
+			out.completedAt = &completedAt
+		}
+	}
+
+	// Spawn a new Job if due and none currently running.
+	if !out.jobActive && shouldSpawnE2(br, time.Now()) {
+		if _, err := r.spawnE2Job(ctx, br); err != nil {
+			log.Error(err, "spawn e2 job")
+		} else {
+			out.jobActive = true
+			log.Info("spawned E2 job", "format", br.Spec.Format)
+		}
+	}
+
+	return out
+}
+
+// buildMetadataValidCondition turns a finished Job into a MetadataValid
+// condition (True if exit 0, False otherwise) with the last 20 lines of
+// pod logs as the message for diagnostic value.
+func (r *BackupRepositoryReconciler) buildMetadataValidCondition(
+	ctx context.Context, job *batchv1.Job,
+) *metav1.Condition {
+	logs := r.readJobOutput(ctx, job)
+	if jobSucceeded(job) {
+		return condTrue(
+			aretev1alpha1.ReasonProbeSucceeded,
+			fmt.Sprintf("validator exit 0; last log: %s", lastLine(logs)),
+		)
+	}
+	return condFalse(
+		aretev1alpha1.ReasonMetadataValidationFailed,
+		fmt.Sprintf("validator failed; last log: %s", lastLine(logs)),
+	)
+}
+
+// lastLine extracts the last non-empty line from multi-line output.
+// Used to keep the condition message short while still informative.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := strings.TrimSpace(lines[i])
+		if l != "" {
+			if len(l) > 200 {
+				return l[:200] + "..."
+			}
+			return l
+		}
+	}
+	return "(no output)"
 }
 
 // resolveCredentials reads the cross-namespace Secret referenced by
@@ -140,10 +239,10 @@ func (r *BackupRepositoryReconciler) recordCredentialsFailure(
 }
 
 // applyStatus computes every condition and updates the structured status
-// fields (claimedLatestBackup, claimedLastSuccessfulBackup, detectedFormat/
-// Version) from the probe result, then patches the BackupRepository.
+// fields from the probe + e2 outcomes, then patches the BackupRepository.
 func (r *BackupRepositoryReconciler) applyStatus(
-	ctx context.Context, br *aretev1alpha1.BackupRepository, p probeResult,
+	ctx context.Context, br *aretev1alpha1.BackupRepository,
+	p probeResult, e2 e2Outcome,
 ) error {
 	patch := client.MergeFrom(br.DeepCopy())
 	now := metav1.Now()
@@ -160,11 +259,29 @@ func (r *BackupRepositoryReconciler) applyStatus(
 		br.Status.ClaimedLastSuccessfulBackup = nil
 	}
 
+	// Ingest any newly-completed E2 result into status.
+	var metadataValid *metav1.Condition
+	if e2.completedResult != nil {
+		metadataValid = e2.completedResult
+		t := metav1.NewTime(*e2.completedAt)
+		br.Status.VerifiedLastValidationAt = &t
+	} else if br.Status.VerifiedLastValidationAt != nil {
+		// No new result this cycle — preserve previous condition.
+		if existing := apimeta.FindStatusCondition(br.Status.Conditions,
+			aretev1alpha1.ConditionMetadataValid); existing != nil &&
+			existing.Reason != aretev1alpha1.ReasonLayerTwoNotYetAvailable {
+			c := *existing
+			metadataValid = &c
+		}
+	}
+
 	r.applyConditions(br, conditionInputs{
 		reachable: condFromBool(p.Reachable, p.ReachableReason, p.ReachableMessage),
 		bucketSecurityValid: ifReachable(p.Reachable,
 			condFromBool(p.BucketSecurityValid, p.BucketSecurityReason, p.BucketSecurityMessage)),
 		backupCurrent: ifReachable(p.Reachable, computeBackupCurrent(br, now.Time)),
+		metadataValid: metadataValid,
+		e2JobActive:   e2.jobActive,
 	})
 
 	return r.Status().Patch(ctx, br, patch)
@@ -177,6 +294,14 @@ type conditionInputs struct {
 	reachable           *metav1.Condition
 	bucketSecurityValid *metav1.Condition
 	backupCurrent       *metav1.Condition
+	// metadataValid is the result of the most recent completed E2 Job.
+	// nil means no completed E2 has been ingested yet (first cycle, or
+	// the controller just started before any Job finished).
+	metadataValid *metav1.Condition
+	// e2JobActive is true if an E2 Job is currently running. Used to
+	// pick the right Unknown reason for MetadataValid in the no-result
+	// case (job is in flight vs. genuinely not yet available).
+	e2JobActive bool
 }
 
 // applyConditions writes the full condition set onto br.Status.Conditions:
@@ -215,10 +340,21 @@ func (r *BackupRepositoryReconciler) applyConditions(
 		removeCondition(cs, aretev1alpha1.ConditionSizeWithinBudget)
 	}
 
-	// E2-E4 sub-conditions — Unknown until the corresponding pass lands
-	setCondition(cs, aretev1alpha1.ConditionMetadataValid, condUnknown(
-		aretev1alpha1.ReasonLayerTwoNotYetAvailable,
-		"E2 metadata validation Job not yet implemented (Pass 3b)"))
+	// MetadataValid (E2): preserve the latest result if we have one;
+	// otherwise emit a clear Unknown distinguishing "Job in flight" from
+	// "haven't run one yet."
+	switch {
+	case in.metadataValid != nil:
+		setCondition(cs, aretev1alpha1.ConditionMetadataValid, in.metadataValid)
+	case in.e2JobActive:
+		setCondition(cs, aretev1alpha1.ConditionMetadataValid, condUnknown(
+			aretev1alpha1.ReasonLayerTwoNotYetAvailable,
+			"E2 validation Job in flight; result will land on next reconcile"))
+	default:
+		setCondition(cs, aretev1alpha1.ConditionMetadataValid, condUnknown(
+			aretev1alpha1.ReasonLayerTwoNotYetAvailable,
+			"no E2 validation has completed yet"))
+	}
 
 	if br.Spec.SampledRetrievalInterval != nil {
 		setCondition(cs, aretev1alpha1.ConditionSampledIntegrityValid, condUnknown(
@@ -419,6 +555,7 @@ func (r *BackupRepositoryReconciler) mapSecretToRepositories(
 func (r *BackupRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&aretev1alpha1.BackupRepository{}).
+		Owns(&batchv1.Job{}).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.mapSecretToRepositories),

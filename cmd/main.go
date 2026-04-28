@@ -17,16 +17,20 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"io"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -185,10 +189,22 @@ func main() {
 	setupLog.Info("validator images configured",
 		"walg", validatorImages.Walg, "restic", validatorImages.Restic)
 
+	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "Failed to build kubernetes clientset")
+		os.Exit(1)
+	}
+	podLogs := func(ctx context.Context, namespace, name string, tailLines int64) (io.ReadCloser, error) {
+		return clientset.CoreV1().Pods(namespace).GetLogs(name, &corev1.PodLogOptions{
+			TailLines: &tailLines,
+		}).Stream(ctx)
+	}
+
 	if err := (&controller.BackupRepositoryReconciler{
 		Client:          mgr.GetClient(),
 		Scheme:          mgr.GetScheme(),
 		ValidatorImages: validatorImages,
+		PodLogs:         podLogs,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "BackupRepository")
 		os.Exit(1)
