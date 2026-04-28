@@ -378,13 +378,21 @@ type resticConfig struct {
 }
 
 // readResticConfig parses <prefix>/config to surface the restic repo format
-// version. claimedLatestBackup stays nil for restic at E1 — restic snapshot
-// enumeration requires decrypting the snapshots/ index, which is E2's job.
+// version, then enumerates <prefix>/snapshots/ to find the most recent
+// snapshot. Snapshot files are tiny encrypted metadata (~400 B each) with
+// one file per snapshot and LastModified == snapshot creation time — so
+// we get a faithful claimedLatestBackup without decryption.
 //
-//nolint:unparam // second return reserved for E2 to populate latestBackup
+// Snapshot file contents (the actual backup tree, encrypted) require the
+// repo password to decode; that's E2's job. SizeBytes stays zero here —
+// the snapshot file size is metadata only, not the underlying backup
+// size. Populating it would require either restic catalog enumeration
+// (E2) or aggregating the data/ tree (expensive).
 func readResticConfig(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
 ) (string, *aretev1alpha1.LatestBackupStatus) {
+	log := logf.FromContext(ctx)
+
 	body, err := getObjectBody(ctx, client, spec.S3.Bucket, spec.S3.Prefix+"/config")
 	if err != nil {
 		return "", nil
@@ -393,7 +401,37 @@ func readResticConfig(
 	if err := json.Unmarshal(body, &c); err != nil {
 		return "", nil
 	}
-	return fmt.Sprintf("repo-v%d", c.Version), nil
+	version := fmt.Sprintf("repo-v%d", c.Version)
+
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var newest minio.ObjectInfo
+	count := 0
+	for obj := range client.ListObjects(listCtx, spec.S3.Bucket, minio.ListObjectsOptions{
+		Prefix:    spec.S3.Prefix + "/snapshots/",
+		Recursive: false,
+	}) {
+		if obj.Err != nil {
+			log.Error(obj.Err, "restic snapshots list error")
+			return version, nil
+		}
+		count++
+		if newest.Key == "" || obj.LastModified.After(newest.LastModified) {
+			newest = obj
+		}
+	}
+	if count == 0 {
+		return version, nil
+	}
+
+	// Snapshot file name is the snapshot ID (sha256 hex). Strip the
+	// prefix so the displayed name is just the ID.
+	name := strings.TrimPrefix(newest.Key, spec.S3.Prefix+"/snapshots/")
+	return version, &aretev1alpha1.LatestBackupStatus{
+		Name:      name,
+		CreatedAt: metav1.NewTime(newest.LastModified),
+	}
 }
 
 // getObjectBody reads an S3 object fully into memory. Only used for tiny
