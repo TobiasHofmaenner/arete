@@ -2,7 +2,7 @@
 
 > Kubernetes operator for S3 backup repository validation.
 
-**Pronounced** /uh-REH-tay/. Greek ἀρετή — *excellence at fulfilling one's purpose*. A backup's *arete* is its restorability.
+Greek ἀρετή — *excellence at fulfilling one's purpose*. A backup's *arete* is its restorability.
 
 ---
 
@@ -15,15 +15,10 @@ Pre-alpha. Design locked, implementation in progress.
 For each `BackupRepository` you declare, arete:
 
 - **Continuously probes S3** to verify the repository exists, is reachable, and is being written to (Layer 1, format-agnostic — works for any backup format pushing to S3)
-- **Optionally runs the real backup tool** against the repository (`wal-g`, `restic`, `barman`) to validate restorability (Layer 2, opt-in per repo)
-- **Exposes unified health status** as Kubernetes CR conditions and Prometheus metrics
-- **Optionally derives sticky decisions** via `ConditionalConfig` resources that downstream deployments consume (e.g., "should this Postgres cluster bootstrap fresh or restore from backup?")
-
-## Why
-
-Backup-and-restore architectures often fail silently — backups complete, files exist in S3, but actual restoration breaks at the worst possible moment because validation tested a *proxy* (custom S3 layout parsing, status delegation, metadata-only checks) rather than what restore would actually see.
-
-arete validates using the **same binaries that would perform the restore**. A passing validation is a near-dry-run of the restoration path. If `wal-g backup-list` says "I see 12 valid backups, latest is X," then a restore against the same repository at the same moment will see those backups too.
+- **Optionally invokes the format's validation commands** (e.g., `wal-g backup-list`, `restic check`, `barman check`) against the repository to verify backups are restorable (Layer 2, opt-in per repo)
+- **Provides a unified inventory and health overview** of every backup repository in the cluster — one place to see what backups exist, whether they're healthy, and when each was last successfully written
+- **Exposes status** as Kubernetes CR conditions and Prometheus metrics
+- **Optionally derives sticky decisions** via `ConditionalConfig` resources that downstream deployments consume (e.g., "should this database bootstrap fresh or restore from backup?")
 
 ## Scope
 
@@ -37,7 +32,7 @@ Out of scope:
 - Backup creation (delegated to existing tools)
 - Backup restoration (delegated to existing tools)
 - Retention enforcement (delegated to S3 lifecycle rules)
-- DR drill orchestration (delegated to workflow engines like Argo Workflows)
+- DR drill orchestration (delegated to workflow engines)
 - Non-S3 storage backends
 
 ## Two CRDs
@@ -47,7 +42,7 @@ Out of scope:
 apiVersion: arete.io/v1
 kind: BackupRepository
 metadata:
-  name: athenesa-postgres
+  name: my-postgres-backups
 spec:
   s3: { endpoint, bucket, prefix, credentialsRef }
   freshness: { maxAge: 25h }
@@ -64,12 +59,12 @@ status:
 apiVersion: arete.io/v1
 kind: ConditionalConfig
 metadata:
-  name: athenesa-bootstrap
+  name: my-bootstrap-decision
 spec:
-  repositoryRef: { name: athenesa-postgres }
+  repositoryRef: { name: my-postgres-backups }
   output:
     configMap:
-      name: nextcloud-cnpg-bootstrap
+      name: cluster-bootstrap-config
       keys:
         BOOTSTRAP_MODE:
           whenHealthy: "recovery"
@@ -78,7 +73,7 @@ spec:
           allocateOnce: "{date}-{shorthex}"
 status:
   decided: recovery
-  incarnationId: "2026-04-28-a4f1c3"
+  incarnationId: "..."
 ```
 
 A `BackupRepository` may have zero, one, or many `ConditionalConfig`s pointing at it. Repos without any consumer still get continuous monitoring.
@@ -90,7 +85,7 @@ See [docs/design.md](docs/design.md) (forthcoming) for the architectural decisio
 - **S3-only**: focused; constraint enables clean code
 - **Two CRDs**: separates observation from derivation
 - **Two validation layers**: cheap monitoring for everything; deep validation opt-in
-- **Real binaries bundled**: validation matches restoration; no silent drift
+- **Real validation binaries bundled**: validation matches restoration; no silent drift between the validator's view and what restore would actually see
 - **Sticky decisions**: controller carries lifecycle state that ephemeral pods can't
 
 ## License
