@@ -57,17 +57,8 @@ type walgBackupListEntry struct {
 }
 
 func parseWalgBackupListJSON(logs string) *aretev1alpha1.LatestBackupStatus {
-	// `wal-g backup-list --detail --json` emits a JSON array on stdout.
-	// scanForJSON finds the array (validators may print other lines).
-	body := scanForJSON(logs, '[')
-	if body == "" {
-		return nil
-	}
 	var entries []walgBackupListEntry
-	if err := json.Unmarshal([]byte(body), &entries); err != nil {
-		return nil
-	}
-	if len(entries) == 0 {
+	if !findAndUnmarshalJSON(logs, '[', &entries) || len(entries) == 0 {
 		return nil
 	}
 	// Pick the latest by FinishTime (fall back to Time then list order).
@@ -130,16 +121,8 @@ type resticSnapSum struct {
 }
 
 func parseResticSnapshotsJSON(logs string) *aretev1alpha1.LatestBackupStatus {
-	// `restic snapshots --json` emits a JSON array.
-	body := scanForJSON(logs, '[')
-	if body == "" {
-		return nil
-	}
 	var snaps []resticSnapshot
-	if err := json.Unmarshal([]byte(body), &snaps); err != nil {
-		return nil
-	}
-	if len(snaps) == 0 {
+	if !findAndUnmarshalJSON(logs, '[', &snaps) || len(snaps) == 0 {
 		return nil
 	}
 	// Pick the latest by Time.
@@ -185,18 +168,38 @@ func parseResticTime(raw string) time.Time {
 
 // --- shared ---
 
-// scanForJSON extracts the longest top-level JSON value from log output
-// that begins with the given delimiter ('{' or '['). Validators may
-// print non-JSON lines (warnings, status messages) before/after the
-// structured output; this finds the first balanced JSON value.
-func scanForJSON(logs string, delim byte) string {
-	close := byte('}')
-	if delim == '[' {
-		close = ']'
+// findAndUnmarshalJSON tries every position of `delim` in logs as the
+// start of a balanced JSON value, attempting to unmarshal each candidate
+// into out. Returns true on first successful unmarshal.
+//
+// This handles validators (notably restic) that print non-JSON lines
+// containing brackets — e.g. progress like "[0:00] 100.00% 13/13" —
+// before the actual JSON output. A naive "find first [" would lock onto
+// the wrong substring.
+func findAndUnmarshalJSON(logs string, delim byte, out any) bool {
+	for offset := 0; offset < len(logs); {
+		idx := strings.IndexByte(logs[offset:], delim)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		body := extractBalanced(logs, start, delim)
+		if body != "" && json.Unmarshal([]byte(body), out) == nil {
+			return true
+		}
+		offset = start + 1
 	}
-	start := strings.IndexByte(logs, delim)
-	if start < 0 {
-		return ""
+	return false
+}
+
+// extractBalanced returns the substring starting at `start` that is a
+// balanced JSON value bounded by `delim` and its matching closer.
+// Tracks string literals (and escapes) to avoid counting brackets that
+// appear inside JSON strings.
+func extractBalanced(logs string, start int, delim byte) string {
+	closer := byte('}')
+	if delim == '[' {
+		closer = ']'
 	}
 	depth := 0
 	inStr := false
@@ -221,7 +224,7 @@ func scanForJSON(logs string, delim byte) string {
 			inStr = true
 		case delim:
 			depth++
-		case close:
+		case closer:
 			depth--
 			if depth == 0 {
 				return logs[start : i+1]
