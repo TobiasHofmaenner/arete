@@ -293,13 +293,16 @@ func (r *BackupRepositoryReconciler) validatorImageFor(format aretev1alpha1.Back
 func e2CommandFor(format aretev1alpha1.BackupFormat) ([]string, []string) {
 	switch format {
 	case aretev1alpha1.BackupFormatWalg:
-		// wal-g validator image entrypoint is `wal-g`. Override with a
-		// POSIX-sh chain so we can run backup-list + wal-verify in one Job.
-		// (ubuntu:22.04's /bin/sh is dash — no `set -o pipefail`. The &&
-		// already short-circuits on failure.)
-		return []string{"sh", "-c"}, []string{
-			"wal-g backup-list && wal-g wal-verify integrity",
-		}
+		// E2 = metadata-only check. `wal-g backup-list` enumerates the
+		// backup catalog using S3 reads alone — proves the catalog is
+		// readable, decryptable, and well-formed.
+		//
+		// `wal-g wal-verify integrity/timeline` intentionally NOT here:
+		// those subcommands require a live Postgres connection to query
+		// the current LSN/timeline, which arete doesn't have. Deeper
+		// WAL chain checks belong in E3 (sampled retrieval) where we
+		// actually pull WAL segments and verify them against each other.
+		return nil, []string{"backup-list"}
 	case aretev1alpha1.BackupFormatRestic:
 		// restic upstream image entrypoint is `restic`. We pass `check`
 		// and rely on env vars (RESTIC_REPOSITORY, RESTIC_PASSWORD) from
