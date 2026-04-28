@@ -170,9 +170,18 @@ func detectFormatVersion(
 // --- wal-g ---
 
 // walgSentinel is the subset of fields we read from
-// basebackups_005/<TS>_backup_stop_sentinel.json. Extra fields ignored.
+// basebackups_005/<TS>_backup_stop_sentinel.json.
+//
+// NOTE: wal-g does NOT write its binary version into the sentinel. The
+// `Version` field is the sentinel JSON FORMAT version (an int). The
+// closest forward-compat signal we can surface from L1 is the
+// (sentinel-format, postgres-version) tuple — actual wal-g binary
+// compatibility is enforced by Layer-2 (where arete's pinned validator
+// either parses the repo or doesn't).
 type walgSentinel struct {
-	Version string `json:"Version"`
+	Version   int    `json:"Version"`   // sentinel format version (e.g. 2)
+	PgVersion int    `json:"PgVersion"` // packed: 160008 = "16.0.8"
+	Hostname  string `json:"Hostname"`
 }
 
 func detectWalgVersion(
@@ -218,13 +227,27 @@ func detectWalgVersion(
 
 	body, err := getObjectBody(ctx, client, spec.S3.Bucket, sentinels[0].Key)
 	if err != nil {
+		log.Error(err, "walg sentinel GET failed", "key", sentinels[0].Key)
 		return ""
 	}
 	var s walgSentinel
 	if err := json.Unmarshal(body, &s); err != nil {
+		log.Error(err, "walg sentinel JSON parse failed", "key", sentinels[0].Key)
 		return ""
 	}
-	return s.Version
+	return fmt.Sprintf("sentinel-v%d/pg-%s", s.Version, formatPgVersion(s.PgVersion))
+}
+
+// formatPgVersion turns wal-g's packed PgVersion (160008) into "16.0.8".
+// Postgres encoding: major*10000 + minor*100 + patch (pre-10) or
+// major*10000 + patch (10+). For 10+, the middle digit is always 0.
+func formatPgVersion(v int) string {
+	if v == 0 {
+		return "unknown"
+	}
+	major := v / 10000
+	patch := v % 100
+	return fmt.Sprintf("%d.0.%d", major, patch)
 }
 
 // --- restic ---
