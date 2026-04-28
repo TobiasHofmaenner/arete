@@ -77,3 +77,22 @@ certmanager:
 # [NETWORK POLICIES]: To enable NetworkPolicies set true
 networkPolicy:
   enable: false
+
+# [VALIDATOR IMAGES]: Per-format images the controller spawns as Jobs for
+# E2 metadata validation, E3 sampled retrieval, and E4 full retrieval.
+#
+# Per ADR-023's strict-contract / always-latest-pinned strategy, these are
+# pinned per arete release (via the chart) — customers don't override them.
+# Bumping arete bumps the validators, which doubles as a forward-compat
+# canary for producer upgrades.
+#
+# wal-g: image built by arete CI alongside the controller (no official
+#        upstream Docker image exists). Tag falls back to .Chart.AppVersion.
+# restic: pinned to upstream restic/restic image.
+validatorImages:
+  walg:
+    repository: ghcr.io/tobiashofmaenner/arete-validator-walg
+    tag: ""  # empty → defaults to .Chart.AppVersion (matches arete release)
+  restic:
+    repository: restic/restic
+    tag: "0.18.1"  # pinned upstream

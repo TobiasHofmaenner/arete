@@ -37,13 +37,19 @@ spec:
           {{- if .Values.controllerManager.container.imagePullPolicy }}
           imagePullPolicy: {{ .Values.controllerManager.container.imagePullPolicy }}
           {{- end }}
-          {{- if .Values.controllerManager.container.env }}
           env:
+            # Validator image refs the controller passes through to Jobs it
+            # spawns for E2-E4. Pinned per arete release in values.yaml.
+            - name: ARETE_VALIDATOR_WALG_IMAGE
+              value: "{{ .Values.validatorImages.walg.repository }}:{{ .Values.validatorImages.walg.tag | default .Chart.AppVersion }}"
+            - name: ARETE_VALIDATOR_RESTIC_IMAGE
+              value: "{{ .Values.validatorImages.restic.repository }}:{{ .Values.validatorImages.restic.tag }}"
+            {{- if .Values.controllerManager.container.env }}
             {{- range $key, $value := .Values.controllerManager.container.env }}
             - name: {{ $key }}
               value: {{ $value }}
             {{- end }}
-          {{- end }}
+            {{- end }}
           livenessProbe:
             {{- toYaml .Values.controllerManager.container.livenessProbe | nindent 12 }}
           readinessProbe:

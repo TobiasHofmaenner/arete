@@ -178,9 +178,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	validatorImages := controller.ValidatorImages{
+		Walg:   os.Getenv("ARETE_VALIDATOR_WALG_IMAGE"),
+		Restic: os.Getenv("ARETE_VALIDATOR_RESTIC_IMAGE"),
+	}
+	setupLog.Info("validator images configured",
+		"walg", validatorImages.Walg, "restic", validatorImages.Restic)
+
 	if err := (&controller.BackupRepositoryReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		ValidatorImages: validatorImages,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "BackupRepository")
 		os.Exit(1)

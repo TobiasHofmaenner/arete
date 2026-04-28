@@ -37,10 +37,21 @@ import (
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
 )
 
+// ValidatorImages holds the per-format validator container image
+// references the controller passes to Jobs it spawns for E2-E4. Pinned per
+// arete release via the Helm chart (see ADR-023's always-latest-pinned
+// strategy + forward-compat-canary insight). Populated from env vars by
+// the manager bootstrap; not used yet (Pass 3b-3 wires the Job spawner).
+type ValidatorImages struct {
+	Walg   string
+	Restic string
+}
+
 // BackupRepositoryReconciler reconciles a BackupRepository object
 type BackupRepositoryReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme          *runtime.Scheme
+	ValidatorImages ValidatorImages
 }
 
 // +kubebuilder:rbac:groups=arete.arete.io,resources=backuprepositories,verbs=get;list;watch;create;update;patch;delete
