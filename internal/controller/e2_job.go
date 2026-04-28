@@ -28,6 +28,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -71,20 +72,39 @@ func (r *BackupRepositoryReconciler) listE2Jobs(
 	return jobs.Items, nil
 }
 
-// jobActive reports whether a Job is currently running (not yet
-// succeeded or failed).
-func jobActive(j *batchv1.Job) bool {
-	return j.Status.Active > 0
+// jobInFlight reports whether a Job has neither completed nor failed
+// terminally — covers "pod still pending" too, which jobActive (looking
+// only at Status.Active) misses.
+func jobInFlight(j *batchv1.Job) bool {
+	for _, c := range j.Status.Conditions {
+		if c.Status != corev1.ConditionTrue {
+			continue
+		}
+		if c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed {
+			return false
+		}
+	}
+	return true
 }
 
 // jobSucceeded reports the Job completed with all containers exiting 0.
 func jobSucceeded(j *batchv1.Job) bool {
-	return j.Status.Succeeded > 0
+	for _, c := range j.Status.Conditions {
+		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // jobFailed reports the Job exhausted retries and gave up.
 func jobFailed(j *batchv1.Job) bool {
-	return j.Status.Failed > 0 && j.Status.Active == 0 && j.Status.Succeeded == 0
+	for _, c := range j.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // jobCompletionTime returns when a Job finished (success or failure).
@@ -114,11 +134,12 @@ func pickLatestCompletedJob(jobs []batchv1.Job) *batchv1.Job {
 	return &done[0]
 }
 
-// firstActiveJob returns the first running Job, or nil. Multiple active
-// Jobs would be a bug (we deduplicate at spawn time) but we tolerate it.
+// firstActiveJob returns the first in-flight Job, or nil. "In-flight"
+// includes pods still pending — important to prevent spawning duplicates
+// during the brief window between Create and the first status update.
 func firstActiveJob(jobs []batchv1.Job) *batchv1.Job {
 	for i := range jobs {
-		if jobActive(&jobs[i]) {
+		if jobInFlight(&jobs[i]) {
 			return &jobs[i]
 		}
 	}
@@ -153,12 +174,14 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 			ActiveDeadlineSeconds:   ptrInt64(int64(jobActiveDeadline.Seconds())),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					RestartPolicy:   corev1.RestartPolicyNever,
+					SecurityContext: restrictedPodSecurityContext(),
 					Containers: []corev1.Container{{
-						Name:    "validator",
-						Image:   image,
-						Command: cmd,
-						Args:    args,
+						Name:            "validator",
+						Image:           image,
+						Command:         cmd,
+						Args:            args,
+						SecurityContext: restrictedContainerSecurityContext(),
 						EnvFrom: []corev1.EnvFromSource{{
 							SecretRef: &corev1.SecretEnvSource{
 								LocalObjectReference: corev1.LocalObjectReference{
@@ -177,9 +200,49 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 		return nil, fmt.Errorf("set owner reference: %w", err)
 	}
 	if err := r.Create(ctx, job); err != nil {
+		// Race: previous reconcile already created this Job before its
+		// status propagated. Treat as success — the Job exists, which is
+		// what we wanted. Next reconcile will see it via the Owns watch.
+		if apierrors.IsAlreadyExists(err) {
+			return job, nil
+		}
 		return nil, fmt.Errorf("create job: %w", err)
 	}
 	return job, nil
+}
+
+// restrictedPodSecurityContext returns the PSS-restricted-compliant Pod-
+// level SecurityContext required by namespaces that enforce the restricted
+// Pod Security Standard.
+func restrictedPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot: ptrBool(true),
+		RunAsUser:    ptrInt64(65532), // nonroot — works for any single-binary image
+		RunAsGroup:   ptrInt64(65532),
+		FSGroup:      ptrInt64(65532),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+// restrictedContainerSecurityContext returns the PSS-restricted-compliant
+// container-level SecurityContext. ReadOnlyRootFilesystem intentionally
+// not set: wal-g and restic both write temporary state during validation
+// (decryption scratch, restic cache) and breaking that trades fewer false
+// negatives for a marginal hardening gain. The other guards (no priv esc,
+// no caps, non-root, runtimeDefault seccomp) are sufficient.
+func restrictedContainerSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptrBool(false),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+		RunAsNonRoot: ptrBool(true),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
 }
 
 // jobActiveDeadline caps a single Job at 10 minutes. A wal-g backup-list +
@@ -316,3 +379,4 @@ type PodLogStreamer func(
 
 func ptrInt32(v int32) *int32 { return &v }
 func ptrInt64(v int64) *int64 { return &v }
+func ptrBool(v bool) *bool    { return &v }
