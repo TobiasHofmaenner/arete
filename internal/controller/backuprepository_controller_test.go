@@ -18,14 +18,14 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
 )
@@ -36,29 +36,37 @@ var _ = Describe("BackupRepository Controller", func() {
 
 		ctx := context.Background()
 
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
-		}
-		backuprepository := &aretev1alpha1.BackupRepository{}
+		// Cluster-scoped — no namespace.
+		typeNamespacedName := types.NamespacedName{Name: resourceName}
 
 		BeforeEach(func() {
 			By("creating the custom resource for the Kind BackupRepository")
-			err := k8sClient.Get(ctx, typeNamespacedName, backuprepository)
+			existing := &aretev1alpha1.BackupRepository{}
+			err := k8sClient.Get(ctx, typeNamespacedName, existing)
 			if err != nil && errors.IsNotFound(err) {
 				resource := &aretev1alpha1.BackupRepository{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
+					ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+					Spec: aretev1alpha1.BackupRepositorySpec{
+						S3: aretev1alpha1.S3Source{
+							Endpoint: "https://s3.example.com",
+							Region:   "eu-central-1",
+							Bucket:   "test-bucket",
+							Prefix:   "test/prefix",
+							CredentialsSecret: aretev1alpha1.SecretReference{
+								Name:      "test-creds",
+								Namespace: "default",
+							},
+						},
+						Format:             aretev1alpha1.BackupFormatWalg,
+						ProbeInterval:      metav1.Duration{Duration: 5 * time.Minute},
+						ValidationInterval: metav1.Duration{Duration: 6 * time.Hour},
 					},
-					// TODO(user): Specify other spec details if needed.
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &aretev1alpha1.BackupRepository{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
@@ -66,6 +74,7 @@ var _ = Describe("BackupRepository Controller", func() {
 			By("Cleanup the specific resource instance BackupRepository")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
+
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &BackupRepositoryReconciler{
@@ -77,8 +86,6 @@ var _ = Describe("BackupRepository Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
 		})
 	})
 })
