@@ -27,31 +27,87 @@ spec:
     - jsonPath: .spec.format
       name: Format
       type: string
+    - jsonPath: .status.conditions[?(@.type=="Healthy")].status
+      name: Health
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="ProbeHealthy")].status
+      name: Probe
+      type: string
     - jsonPath: .status.conditions[?(@.type=="Reachable")].status
       name: Reachable
       type: string
-    - jsonPath: .status.conditions[?(@.type=="Healthy")].status
-      name: Healthy
+    - jsonPath: .status.conditions[?(@.type=="BackupCurrent")].status
+      name: Current
       type: string
-    - jsonPath: .status.detectedVersion
-      name: Detected
-      priority: 1
+    - jsonPath: .status.claimedLastSuccessfulBackup
+      name: Last Backup
+      type: date
+    - jsonPath: .status.claimedLatestBackup.sizeBytes
+      name: Backup Size
       type: string
-    - jsonPath: .status.inventory.objectCount
-      name: Objects
-      type: integer
     - jsonPath: .status.lastProbedAt
       name: Last Probed
+      type: date
+    - jsonPath: .status.conditions[?(@.type=="ValidationHealthy")].status
+      name: Validation
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="MetadataValid")].status
+      name: Metadata
+      type: string
+    - jsonPath: .status.verifiedLastValidationAt
+      name: Last Validated
       type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
+    - jsonPath: .status.detectedVersion
+      name: Detected
+      priority: 1
+      type: string
+    - jsonPath: .status.observedInventory.objectCount
+      name: Objects
+      priority: 1
+      type: integer
+    - jsonPath: .status.observedInventory.totalBytes
+      name: Total Size
+      priority: 1
+      type: string
+    - jsonPath: .status.observedInventory.oldestObject
+      name: Oldest
+      priority: 1
+      type: date
+    - jsonPath: .status.observedInventory.newestObject
+      name: Newest
+      priority: 1
+      type: date
+    - jsonPath: .status.conditions[?(@.type=="BucketSecurityValid")].status
+      name: Bucket Security
+      priority: 1
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="SizeWithinBudget")].status
+      name: Budget
+      priority: 1
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="SampledIntegrityValid")].status
+      name: Sampled
+      priority: 1
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="FullRetrievalCompleted")].status
+      name: E4
+      priority: 1
+      type: string
+    - jsonPath: .status.lastFullRetrieval.throughputBytesPerSec
+      name: E4 Throughput
+      priority: 1
+      type: integer
     name: v1alpha1
     schema:
       openAPIV3Schema:
         description: |-
           BackupRepository declares an S3-backed backup location to be continuously
-          probed (Layer 1) and format-validated (Layer 2) by the arete operator.
+          validated by the arete operator at four depth levels (E1 existence →
+          E2 metadata → E3 sampled retrieval → E4 full retrieval). See ADR-022
+          for the layer model and ADR-023 for arete's design.
         properties:
           apiVersion:
             description: |-
@@ -74,10 +130,22 @@ spec:
             description: |-
               BackupRepositorySpec defines the desired state of BackupRepository.
 
-              All fields are required by design — arete enforces a strict contract
-              (see ADR-023). There are no optional best-practice fields, no opt-out
-              flags, and no escape hatches. If a CR exists, the contract is in force.
+              All baseline fields (probe + metadata validation intervals, format,
+              credentials, max backup lag) are required by design — arete enforces a
+              strict contract (see ADR-023). E3 (sampled retrieval) and E4 (full
+              retrieval) are opt-in by interval presence: setting the interval enables
+              the level. There are no opt-out / pause / suspend / skip fields.
             properties:
+              expectedSizeBudget:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  expectedSizeBudget is an optional cap on observedInventory.totalBytes.
+                  When set, SizeWithinBudget condition is emitted; when exceeded,
+                  SizeWithinBudget is False with reason SizeBudgetExceeded.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
               format:
                 description: |-
                   format is the on-disk layout of the repository. Required — auto-detection
@@ -87,17 +155,64 @@ spec:
                 - restic
                 - barman
                 type: string
+              fullRetrievalInterval:
+                description: |-
+                  fullRetrievalInterval is how often the E4 (full retrieval) performance-
+                  test Job runs. Optional — setting it enables E4. Bounded to [1d, 30d]
+                  when set. Can also be triggered manually via the
+                  arete.arete.io/trigger-full-retrieval annotation.
+                type: string
+                x-kubernetes-validations:
+                - message: fullRetrievalInterval must be between 1d and 30d when set
+                  rule: duration(self) >= duration('24h') && duration(self) <= duration('720h')
+              fullRetrievalPVCSize:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  fullRetrievalPVCSize is the size of the PVC arete provisions for the
+                  E4 Job. Sized for the largest single object only (per-chunk delete keeps
+                  steady-state usage at one object's worth, regardless of repo size).
+                  Required iff fullRetrievalInterval is set. Bounded to [1Gi, 100Gi].
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              fullRetrievalStorageClass:
+                description: |-
+                  fullRetrievalStorageClass is the StorageClass arete uses for the PVC
+                  that streams E4 downloads. Should match the customer's actual restore
+                  storage class so the throughput metric is an honest dress rehearsal.
+                  Required iff fullRetrievalInterval is set.
+                minLength: 1
+                type: string
+              maxBackupLag:
+                description: |-
+                  maxBackupLag is the maximum age of the most recent successful backup
+                  before BackupCurrent flips to False. Bounded to [1h, 7d].
+                type: string
+                x-kubernetes-validations:
+                - message: maxBackupLag must be between 1h and 7d
+                  rule: duration(self) >= duration('1h') && duration(self) <= duration('168h')
+              metadataValidationInterval:
+                description: |-
+                  metadataValidationInterval is how often the E2 (format-aware metadata)
+                  validation Job runs (e.g. wal-g backup-list + wal-verify, restic check).
+                  Bounded to [1h, 24h].
+                type: string
+                x-kubernetes-validations:
+                - message: metadataValidationInterval must be between 1h and 24h
+                  rule: duration(self) >= duration('1h') && duration(self) <= duration('24h')
               probeInterval:
                 description: |-
-                  probeInterval is how often Layer-1 (format-agnostic S3 reachability)
-                  is checked. Bounded to [1m, 1h] — values outside this range render the
-                  contract meaningless and are rejected.
+                  probeInterval is how often the E1 (existence) probe runs in the
+                  controller process. Bounded to [1m, 1h].
                 type: string
                 x-kubernetes-validations:
                 - message: probeInterval must be between 1m and 1h
                   rule: duration(self) >= duration('1m') && duration(self) <= duration('1h')
               s3:
-                description: s3 is the location of the repository.
+                description: |-
+                  s3 is the location of the repository plus declared bucket security
+                  expectations.
                 properties:
                   bucket:
                     description: bucket is the S3 bucket name.
@@ -121,9 +236,11 @@ spec:
                     type: object
                   endpoint:
                     description: |-
-                      endpoint is the S3 API URL (e.g., https://s3.eu-central-1.amazonaws.com,
-                      or a MinIO endpoint). Must include scheme.
-                    pattern: ^https?://.+
+                      endpoint is the S3 API URL. HTTPS is mandatory (strict contract — no
+                      field exists to override). Examples:
+                        https://s3.eu-central-1.amazonaws.com
+                        https://minio.example.internal
+                    pattern: ^https://.+
                     type: string
                   prefix:
                     description: |-
@@ -136,6 +253,19 @@ spec:
                     description: region is the S3 region.
                     minLength: 1
                     type: string
+                  requireBucketEncryption:
+                    description: |-
+                      requireBucketEncryption asserts that the bucket must have server-side
+                      encryption (SSE-S3 or SSE-KMS) enabled. When true, BucketSecurityValid
+                      is False if the backend does not report bucket encryption configured.
+                      Opt-in.
+                    type: boolean
+                  requireObjectLock:
+                    description: |-
+                      requireObjectLock asserts that the bucket must have S3 Object Lock
+                      configured. When true, BucketSecurityValid is False if the backend
+                      does not report Object Lock as enabled. Opt-in.
+                    type: boolean
                 required:
                 - bucket
                 - credentialsSecret
@@ -143,28 +273,88 @@ spec:
                 - prefix
                 - region
                 type: object
-              validationInterval:
+              sampledRetrievalInterval:
                 description: |-
-                  validationInterval is how often Layer-2 (format-aware) validation runs
-                  (e.g. wal-g backup-list, restic check). Bounded to [1h, 24h].
+                  sampledRetrievalInterval is how often the E3 (sampled retrieval) Job
+                  runs. Optional — setting it enables E3. Bounded to [6h, 7d] when set.
                 type: string
                 x-kubernetes-validations:
-                - message: validationInterval must be between 1h and 24h
-                  rule: duration(self) >= duration('1h') && duration(self) <= duration('24h')
+                - message: sampledRetrievalInterval must be between 6h and 7d when
+                    set
+                  rule: duration(self) >= duration('6h') && duration(self) <= duration('168h')
+              sampledRetrievalObjects:
+                description: |-
+                  sampledRetrievalObjects is the number of objects to download per E3
+                  cycle. Fixed count (NOT a percent) keeps cost scale-invariant as the
+                  repo grows. Required iff sampledRetrievalInterval is set. Bounded to
+                  [10, 1000].
+                format: int32
+                maximum: 1000
+                minimum: 10
+                type: integer
             required:
             - format
+            - maxBackupLag
+            - metadataValidationInterval
             - probeInterval
             - s3
-            - validationInterval
             type: object
           status:
-            description: BackupRepositoryStatus defines the observed state of BackupRepository.
+            description: |-
+              BackupRepositoryStatus defines the observed state of BackupRepository.
+
+              Field naming uses provenance prefixes: claimed* (producer self-reports
+              parsed from sentinels — NOT verified by arete), observed* (arete
+              measured directly via S3 API), verified* (arete proved via E2-E4
+              validators). Conditions describe what passed and what didn't; the
+              substructs hold the data behind those conditions.
             properties:
+              claimedLastSuccessfulBackup:
+                description: |-
+                  claimedLastSuccessfulBackup is a convenience surface of
+                  claimedLatestBackup.createdAt — the single most operationally
+                  important field for "how long since the last backup."
+                format: date-time
+                type: string
+              claimedLatestBackup:
+                description: |-
+                  claimedLatestBackup is the producer-reported metadata of the most
+                  recent backup (parsed from format-specific sentinel files).
+                properties:
+                  createdAt:
+                    description: createdAt is the FinishTime parsed from the sentinel.
+                    format: date-time
+                    type: string
+                  name:
+                    description: |-
+                      name is the backup identifier as the producer wrote it (e.g. wal-g
+                      BackupName, restic snapshot ID).
+                    type: string
+                  sizeBytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: sizeBytes is the producer-reported compressed size.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  uncompressedSizeBytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      uncompressedSizeBytes is the producer-reported uncompressed size, if
+                      available in the sentinel.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                required:
+                - createdAt
+                - name
+                - sizeBytes
+                type: object
               conditions:
                 description: |-
-                  conditions reflect the current state of the repository.
-                  Only Reachable and Healthy are emitted; both are binary (True | False
-                  | Unknown). No Warning tier — see ADR-023 strict-contract rule.
+                  conditions reflect the current state of the repository. See the
+                  Condition* constants in the api package for the enumerable types.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -225,19 +415,105 @@ spec:
                 x-kubernetes-list-type: map
               detectedFormat:
                 description: |-
-                  detectedFormat is the on-disk format inferred from sentinel files in
-                  the repository (e.g. parsed from a wal-g backup_stop_sentinel.json or
-                  a restic config). Informational only — the validator binary is always
-                  arete's pinned latest, never selected by detected version.
+                  detectedFormat is the on-disk format inferred from sentinel files
+                  in the repository. Informational.
                 type: string
               detectedVersion:
                 description: |-
-                  detectedVersion is the producer tool version that wrote the sentinel
-                  (e.g. "wal-g 2.0.1"). Informational; surfaces forward-compat skew when
-                  arete's pinned validator can no longer parse it.
+                  detectedVersion is the producer-claimed version string parsed from
+                  the sentinel (e.g. "sentinel-v2/pg-16.0.8" for wal-g). Informational
+                  — the validator binary used at E2-E4 is always arete's pinned latest,
+                  independent of detected version.
                 type: string
-              inventory:
-                description: inventory summarises the current contents of the repository.
+              lastFullRetrieval:
+                description: |-
+                  lastFullRetrieval is the result of the most recent E4 Job. Stays nil
+                  until E4 has been enabled and run at least once.
+                properties:
+                  bytesTransferred:
+                    description: bytesTransferred is the cumulative bytes read across
+                      all objects.
+                    format: int64
+                    type: integer
+                  completedAt:
+                    description: completedAt is when the E4 Job finished (regardless
+                      of success).
+                    format: date-time
+                    type: string
+                  durationSeconds:
+                    description: durationSeconds is total wall time for the retrieval.
+                    format: int64
+                    type: integer
+                  failedObjects:
+                    description: failedObjects is the number of GETs that errored
+                      mid-stream.
+                    format: int64
+                    type: integer
+                  objectsRetrieved:
+                    description: objectsRetrieved is the number of S3 objects successfully
+                      fetched.
+                    format: int64
+                    type: integer
+                  throughputBytesPerSec:
+                    description: |-
+                      throughputBytesPerSec is bytesTransferred / durationSeconds —
+                      includes Ceph RBD write overhead because the PVC writes are real.
+                      Plug this into RTO calculations.
+                    format: int64
+                    type: integer
+                  triggerSource:
+                    description: triggerSource records who started this run.
+                    enum:
+                    - scheduled
+                    - manual
+                    type: string
+                required:
+                - bytesTransferred
+                - completedAt
+                - durationSeconds
+                - failedObjects
+                - objectsRetrieved
+                - throughputBytesPerSec
+                - triggerSource
+                type: object
+              lastProbedAt:
+                description: lastProbedAt is when the most recent E1 probe completed.
+                format: date-time
+                type: string
+              observedGeneration:
+                description: observedGeneration is the .metadata.generation last reconciled.
+                format: int64
+                type: integer
+              observedGrowth:
+                description: |-
+                  observedGrowth is arete's measurement of inventory growth over a
+                  rolling window. Stays nil until 3-growth ships.
+                properties:
+                  bytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: bytes is the increase in observedInventory.totalBytes
+                      over the window.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  sampledAt:
+                    description: sampledAt is when the growth measurement completed.
+                    format: date-time
+                    type: string
+                  window:
+                    description: window is the time span this delta covers (e.g. 7d).
+                    type: string
+                required:
+                - bytes
+                - sampledAt
+                - window
+                type: object
+              observedInventory:
+                description: |-
+                  observedInventory is arete's direct measurement of repository contents
+                  (from S3 LIST). Recomputed at metadataValidationInterval cadence
+                  (cheaper than per-probe). Stays nil until 3-inventory ships.
                 properties:
                   newestObject:
                     description: newestObject is the LastModified of the latest object.
@@ -264,19 +540,12 @@ spec:
                 - objectCount
                 - totalBytes
                 type: object
-              lastProbedAt:
-                description: lastProbedAt is when the most recent Layer-1 probe completed.
+              verifiedLastValidationAt:
+                description: |-
+                  verifiedLastValidationAt is when the most recent successful E2 run
+                  completed. Stays nil until 3c (E2 Jobs) ships.
                 format: date-time
                 type: string
-              lastValidatedAt:
-                description: lastValidatedAt is when the most recent Layer-2 validation
-                  completed.
-                format: date-time
-                type: string
-              observedGeneration:
-                description: observedGeneration is the .metadata.generation last reconciled.
-                format: int64
-                type: integer
             type: object
         required:
         - spec

@@ -57,9 +57,10 @@ var _ = Describe("BackupRepository Controller", func() {
 								Namespace: "default",
 							},
 						},
-						Format:             aretev1alpha1.BackupFormatWalg,
-						ProbeInterval:      metav1.Duration{Duration: 5 * time.Minute},
-						ValidationInterval: metav1.Duration{Duration: 6 * time.Hour},
+						Format:                     aretev1alpha1.BackupFormatWalg,
+						ProbeInterval:              metav1.Duration{Duration: 5 * time.Minute},
+						MetadataValidationInterval: metav1.Duration{Duration: 6 * time.Hour},
+						MaxBackupLag:               metav1.Duration{Duration: 25 * time.Hour},
 					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())

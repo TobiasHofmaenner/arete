@@ -29,6 +29,8 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
@@ -47,67 +49,66 @@ type S3Credentials struct {
 	SessionToken    string // optional, for STS-issued creds
 }
 
-// probeResult is the outcome of one Layer-1 cycle.
+// probeResult is the structured outcome of one E1 cycle. Each block maps
+// 1:1 to an E1 sub-condition; the controller composes them into rollups.
 type probeResult struct {
-	Reachable       bool
-	Reason          string // condition Reason (CamelCase)
-	Message         string // condition Message (human-readable)
+	// Reachable (E1 sub) — bucket+prefix accessible via LIST
+	Reachable        bool
+	ReachableReason  string
+	ReachableMessage string
+
+	// BucketSecurityValid (E1 sub) — declared bucket security posture
+	// matches what the backend reports
+	BucketSecurityValid   bool
+	BucketSecurityReason  string
+	BucketSecurityMessage string
+
+	// Producer-claimed metadata parsed from sentinels (NOT verified)
 	DetectedFormat  string
 	DetectedVersion string
+	LatestBackup    *aretev1alpha1.LatestBackupStatus
 }
 
-// probeRepository runs one Layer-1 probe against the configured repository.
-// Pure function over (spec, creds) — no Kubernetes side effects.
-//
-// Two phases:
-//  1. Cheap reachability LIST under spec.prefix (caps at probeReachabilityCap).
-//  2. Format-aware sentinel hunt for detectedFormat/detectedVersion.
-//
-// Phase 2 is best-effort; failure to find a sentinel does NOT flip Reachable.
+// probeRepository runs one E1 cycle. Pure function over (spec, creds) — no
+// Kubernetes side effects. The returned probeResult captures every E1 sub-
+// signal the controller needs to set conditions; downstream computations
+// (BackupCurrent, ProbeHealthy rollup) live in the controller.
 func probeRepository(
 	ctx context.Context, spec aretev1alpha1.BackupRepositorySpec, creds S3Credentials,
 ) probeResult {
 	client, err := buildS3Client(spec.S3, creds)
 	if err != nil {
 		return probeResult{
-			Reachable: false,
-			Reason:    "ClientBuildFailed",
-			Message:   err.Error(),
+			Reachable:        false,
+			ReachableReason:  aretev1alpha1.ReasonClientBuildFailed,
+			ReachableMessage: err.Error(),
 		}
 	}
 
-	// Phase 1: reachability. Non-recursive LIST is enough — we only need to
-	// confirm creds + auth + that the prefix is queryable. Empty prefix is
-	// still Reachable=True (Healthy will reject it in Pass 3).
-	const probeReachabilityCap = 10
-	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	count := 0
-	for obj := range client.ListObjects(listCtx, spec.S3.Bucket, minio.ListObjectsOptions{
-		Prefix:    spec.S3.Prefix + "/",
-		Recursive: false,
-	}) {
-		if obj.Err != nil {
-			reason, msg := classifyS3Error(obj.Err)
-			return probeResult{Reachable: false, Reason: reason, Message: msg}
-		}
-		count++
-		if count >= probeReachabilityCap {
-			break
-		}
-	}
-
+	// Phase 1: reachability via cheap non-recursive LIST.
+	reachable, rReason, rMsg := checkReachability(ctx, client, spec)
 	result := probeResult{
-		Reachable: true,
-		Reason:    "ProbeSucceeded",
-		Message:   fmt.Sprintf("prefix reachable, %d top-level entries sampled", count),
+		Reachable:        reachable,
+		ReachableReason:  rReason,
+		ReachableMessage: rMsg,
+	}
+	if !reachable {
+		// No point checking security or sentinels if we can't list.
+		return result
 	}
 
-	// Phase 2: format-aware sentinel hunt.
-	format, version := detectFormatVersion(ctx, client, spec)
+	// Phase 2: bucket security posture (independent of phase 1 success).
+	secValid, secReason, secMsg := checkBucketSecurity(ctx, client, spec)
+	result.BucketSecurityValid = secValid
+	result.BucketSecurityReason = secReason
+	result.BucketSecurityMessage = secMsg
+
+	// Phase 3: format-aware sentinel parse (extracts version + latestBackup).
+	format, version, latest := detectFormatAndMetadata(ctx, client, spec)
 	result.DetectedFormat = format
 	result.DetectedVersion = version
+	result.LatestBackup = latest
+
 	return result
 }
 
@@ -129,6 +130,80 @@ func buildS3Client(src aretev1alpha1.S3Source, creds S3Credentials) (*minio.Clie
 	})
 }
 
+// checkReachability runs a bounded non-recursive LIST under the prefix to
+// confirm creds + auth + that the prefix is queryable. Empty prefix is
+// still Reachable=True (BackupCurrent will reject it via lag check).
+func checkReachability(
+	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
+) (bool, string, string) {
+	const probeReachabilityCap = 10
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	count := 0
+	for obj := range client.ListObjects(listCtx, spec.S3.Bucket, minio.ListObjectsOptions{
+		Prefix:    spec.S3.Prefix + "/",
+		Recursive: false,
+	}) {
+		if obj.Err != nil {
+			reason, msg := classifyS3Error(obj.Err)
+			return false, reason, msg
+		}
+		count++
+		if count >= probeReachabilityCap {
+			break
+		}
+	}
+	return true, aretev1alpha1.ReasonProbeSucceeded,
+		fmt.Sprintf("prefix reachable, %d top-level entries sampled", count)
+}
+
+// checkBucketSecurity verifies the declared bucket security posture matches
+// what the backend reports. Today's checks:
+//   - HTTPS endpoint (admission rejects http://, but re-verify defensively)
+//   - Object lock (only if spec.s3.requireObjectLock == true)
+//   - Bucket encryption (only if spec.s3.requireBucketEncryption == true)
+//
+// Public-access-block parsing is deferred (requires bucket policy
+// inspection — not all S3-compat backends expose it consistently).
+func checkBucketSecurity(
+	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
+) (bool, string, string) {
+	if !strings.HasPrefix(spec.S3.Endpoint, "https://") {
+		return false, aretev1alpha1.ReasonInsecureEndpoint,
+			"endpoint must use https://"
+	}
+
+	checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	var checked []string
+
+	if spec.S3.RequireObjectLock {
+		_, _, _, _, err := client.GetObjectLockConfig(checkCtx, spec.S3.Bucket)
+		if err != nil {
+			return false, aretev1alpha1.ReasonObjectLockMissing,
+				fmt.Sprintf("requireObjectLock=true but bucket reports: %s", err.Error())
+		}
+		checked = append(checked, "object-lock")
+	}
+
+	if spec.S3.RequireBucketEncryption {
+		_, err := client.GetBucketEncryption(checkCtx, spec.S3.Bucket)
+		if err != nil {
+			return false, aretev1alpha1.ReasonBucketEncryptionMissing,
+				fmt.Sprintf("requireBucketEncryption=true but bucket reports: %s", err.Error())
+		}
+		checked = append(checked, "bucket-encryption")
+	}
+
+	msg := "https endpoint"
+	if len(checked) > 0 {
+		msg = fmt.Sprintf("https endpoint, verified: %s", strings.Join(checked, ", "))
+	}
+	return true, aretev1alpha1.ReasonProbeSucceeded, msg
+}
+
 // classifyS3Error turns a raw minio-go error into a (reason, message) pair
 // suitable for a Reachable=False condition. CamelCase reason → alert label.
 func classifyS3Error(err error) (string, string) {
@@ -136,35 +211,39 @@ func classifyS3Error(err error) (string, string) {
 	if errors.As(err, &resp) {
 		switch resp.Code {
 		case "NoSuchBucket":
-			return "BucketNotFound", resp.Message
+			return aretev1alpha1.ReasonBucketNotFound, resp.Message
 		case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch":
-			return "CredentialsRejected", resp.Message
+			return aretev1alpha1.ReasonCredentialsRejected, resp.Message
 		default:
 			if resp.Code != "" {
-				return "S3APIError", fmt.Sprintf("%s: %s", resp.Code, resp.Message)
+				return aretev1alpha1.ReasonS3APIError,
+					fmt.Sprintf("%s: %s", resp.Code, resp.Message)
 			}
 		}
 	}
-	return "S3Unreachable", err.Error()
+	return aretev1alpha1.ReasonS3Unreachable, err.Error()
 }
 
-// detectFormatVersion does a format-specific targeted lookup for the
-// producer version. Best-effort; returns ("", "") if the sentinel is
-// missing or unparseable.
-func detectFormatVersion(
+// detectFormatAndMetadata does a format-specific targeted lookup for the
+// producer version AND extracts the LatestBackup struct from the same
+// sentinel. Best-effort: returns zero values if the sentinel is missing
+// or unparseable.
+func detectFormatAndMetadata(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
-) (string, string) {
+) (format string, version string, latest *aretev1alpha1.LatestBackupStatus) {
 	switch spec.Format {
 	case aretev1alpha1.BackupFormatWalg:
-		return "walg", detectWalgVersion(ctx, client, spec)
+		v, l := readWalgSentinel(ctx, client, spec)
+		return "walg", v, l
 	case aretev1alpha1.BackupFormatRestic:
-		return "restic", detectResticVersion(ctx, client, spec)
+		v, l := readResticConfig(ctx, client, spec)
+		return "restic", v, l
 	case aretev1alpha1.BackupFormatBarman:
-		// Barman sentinel parsing not implemented in Pass 2 — format is
-		// reported but version stays empty.
-		return "barman", ""
+		// Barman sentinel parsing not implemented yet — format reported
+		// but version/latestBackup stay empty.
+		return "barman", "", nil
 	}
-	return "", ""
+	return "", "", nil
 }
 
 // --- wal-g ---
@@ -174,50 +253,51 @@ func detectFormatVersion(
 //
 // NOTE: wal-g does NOT write its binary version into the sentinel. The
 // `Version` field is the sentinel JSON FORMAT version (an int). The
-// closest forward-compat signal we can surface from L1 is the
+// closest forward-compat signal we can surface from E1 is the
 // (sentinel-format, postgres-version) tuple — actual wal-g binary
-// compatibility is enforced by Layer-2 (where arete's pinned validator
-// either parses the repo or doesn't).
+// compatibility is enforced by E2 (where arete's pinned validator either
+// parses the repo or doesn't).
 type walgSentinel struct {
-	Version   int    `json:"Version"`   // sentinel format version (e.g. 2)
-	PgVersion int    `json:"PgVersion"` // packed: 160008 = "16.0.8"
-	Hostname  string `json:"Hostname"`
+	Version          int    `json:"Version"`   // sentinel format version (e.g. 2)
+	PgVersion        int    `json:"PgVersion"` // packed: 160008 = "16.0.8"
+	Hostname         string `json:"Hostname"`
+	BackupName       string `json:"BackupName"`
+	StartTime        string `json:"StartTime"`  // RFC3339 / ISO8601 microseconds
+	FinishTime       string `json:"FinishTime"` // ditto
+	CompressedSize   int64  `json:"CompressedSize"`
+	UncompressedSize int64  `json:"UncompressedSize"`
 }
 
-func detectWalgVersion(
+func readWalgSentinel(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
-) string {
+) (string, *aretev1alpha1.LatestBackupStatus) {
 	log := logf.FromContext(ctx)
 	const suffix = "_backup_stop_sentinel.json"
 
-	// wal-g writes one sentinel per basebackup, all under
+	// wal-g writes one sentinel per basebackup at the top of
 	// `<prefix>/basebackups_005/`. List that subdir non-recursively to skip
-	// the per-backup tar_partitions noise — sentinels live at the top of
-	// the basebackups dir alongside the per-backup subdirs.
+	// per-backup tar_partitions noise — sentinels live alongside the
+	// per-backup subdirs as direct children.
 	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	listPrefix := spec.S3.Prefix + "/basebackups_005/"
-	log.Info("walg sentinel hunt starting", "bucket", spec.S3.Bucket, "prefix", listPrefix)
 
 	var sentinels []minio.ObjectInfo
-	total := 0
 	for obj := range client.ListObjects(listCtx, spec.S3.Bucket, minio.ListObjectsOptions{
 		Prefix:    listPrefix,
 		Recursive: false,
 	}) {
 		if obj.Err != nil {
 			log.Error(obj.Err, "walg sentinel hunt list error")
-			return ""
+			return "", nil
 		}
-		total++
 		if strings.HasSuffix(obj.Key, suffix) {
 			sentinels = append(sentinels, obj)
 		}
 	}
-	log.Info("walg sentinel hunt finished", "totalObjects", total, "sentinelsFound", len(sentinels))
 	if len(sentinels) == 0 {
-		return ""
+		return "", nil
 	}
 	// Pick the most recent sentinel — reflects the version that wrote the
 	// latest backup, which is what we want to compare to arete's validator.
@@ -228,14 +308,50 @@ func detectWalgVersion(
 	body, err := getObjectBody(ctx, client, spec.S3.Bucket, sentinels[0].Key)
 	if err != nil {
 		log.Error(err, "walg sentinel GET failed", "key", sentinels[0].Key)
-		return ""
+		return "", nil
 	}
 	var s walgSentinel
 	if err := json.Unmarshal(body, &s); err != nil {
 		log.Error(err, "walg sentinel JSON parse failed", "key", sentinels[0].Key)
-		return ""
+		return "", nil
 	}
-	return fmt.Sprintf("sentinel-v%d/pg-%s", s.Version, formatPgVersion(s.PgVersion))
+
+	version := fmt.Sprintf("sentinel-v%d/pg-%s", s.Version, formatPgVersion(s.PgVersion))
+	latest := walgSentinelToLatestBackup(s, sentinels[0].LastModified)
+	return version, latest
+}
+
+// walgSentinelToLatestBackup converts a parsed sentinel into the public
+// claimedLatestBackup status struct. Falls back to the sentinel object's
+// LastModified if FinishTime is unparseable.
+func walgSentinelToLatestBackup(
+	s walgSentinel, sentinelLastModified time.Time,
+) *aretev1alpha1.LatestBackupStatus {
+	createdAt := sentinelLastModified
+	if s.FinishTime != "" {
+		// wal-g emits RFC3339-ish with microseconds. Try a few variants.
+		for _, layout := range []string{
+			time.RFC3339Nano,
+			"2006-01-02T15:04:05.000000Z",
+			"2006-01-02T15:04:05Z",
+		} {
+			if t, err := time.Parse(layout, s.FinishTime); err == nil {
+				createdAt = t
+				break
+			}
+		}
+	}
+
+	out := &aretev1alpha1.LatestBackupStatus{
+		Name:      s.BackupName,
+		CreatedAt: metav1.NewTime(createdAt),
+		SizeBytes: *resource.NewQuantity(s.CompressedSize, resource.BinarySI),
+	}
+	if s.UncompressedSize > 0 {
+		uq := resource.NewQuantity(s.UncompressedSize, resource.BinarySI)
+		out.UncompressedSizeBytes = uq
+	}
+	return out
 }
 
 // formatPgVersion turns wal-g's packed PgVersion (160008) into "16.0.8".
@@ -261,20 +377,23 @@ type resticConfig struct {
 	ID      string `json:"id"`
 }
 
-func detectResticVersion(
+func readResticConfig(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
-) string {
+) (string, *aretev1alpha1.LatestBackupStatus) {
 	// restic config lives at a fixed key relative to the repo prefix.
-	// GET it directly — no need to list first.
 	body, err := getObjectBody(ctx, client, spec.S3.Bucket, spec.S3.Prefix+"/config")
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	var c resticConfig
 	if err := json.Unmarshal(body, &c); err != nil {
-		return ""
+		return "", nil
 	}
-	return fmt.Sprintf("repo-v%d", c.Version)
+	// Restic snapshot enumeration to find the latest backup is non-trivial
+	// (snapshots/* index needs decryption). Defer to E2 — for now we only
+	// surface the repo format version. claimedLatestBackup stays nil for
+	// restic until E2 ships and can populate it via `restic snapshots`.
+	return fmt.Sprintf("repo-v%d", c.Version), nil
 }
 
 // getObjectBody reads an S3 object fully into memory. Only used for tiny
