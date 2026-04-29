@@ -185,6 +185,13 @@ func (r *BackupRepositoryReconciler) e3CommandArgsEnv(
 
 // pickWalgSamples LISTs <prefix>/wal_005/ and returns N random WAL
 // segment names (basename without extension, as wal-g wal-fetch expects).
+//
+// Filters out non-segment files: <prefix>/wal_005/ also contains
+// `.backup` history files (e.g. base_<lsn>.<offset>.backup.br) and
+// `.history` timeline files. wal-g wal-fetch only operates on plain
+// segment names (exactly 24 hex chars). Sampling those non-segments
+// would feed wal-g garbage and yield "corrupted chunk" decryption
+// errors — caught empirically against the test tenant.
 func (r *BackupRepositoryReconciler) pickWalgSamples(
 	ctx context.Context, br *aretev1alpha1.BackupRepository, creds S3Credentials, n int,
 ) ([]string, error) {
@@ -196,7 +203,7 @@ func (r *BackupRepositoryReconciler) pickWalgSamples(
 	defer cancel()
 
 	listPrefix := br.Spec.S3.Prefix + "/wal_005/"
-	var keys []string
+	var segments []string
 	for obj := range mc.ListObjects(listCtx, br.Spec.S3.Bucket, minio.ListObjectsOptions{
 		Prefix:    listPrefix,
 		Recursive: true,
@@ -204,33 +211,44 @@ func (r *BackupRepositoryReconciler) pickWalgSamples(
 		if obj.Err != nil {
 			return nil, obj.Err
 		}
-		keys = append(keys, obj.Key)
+		if name, ok := walgSegmentName(obj.Key, listPrefix); ok {
+			segments = append(segments, name)
+		}
 	}
-	if len(keys) == 0 {
+	if len(segments) == 0 {
 		return nil, nil
 	}
 
-	// Random N (with replacement allowed if N > len). We typically have
-	// thousands of WAL segments and N is in the 10..1000 range, so
-	// without-replacement sampling via shuffle is fine.
-	if n > len(keys) {
-		n = len(keys)
+	// Random N. We typically have thousands of WAL segments and N is
+	// in the 10..1000 range, so without-replacement via shuffle is fine.
+	if n > len(segments) {
+		n = len(segments)
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	rng.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
-	selected := keys[:n]
+	rng.Shuffle(len(segments), func(i, j int) { segments[i], segments[j] = segments[j], segments[i] })
+	selected := segments[:n]
+	sort.Strings(selected) // deterministic order in the Job command line for log readability
+	return selected, nil
+}
 
-	// wal-g wal-fetch expects the segment name only — strip the prefix
-	// AND any extension (.lzo / .br / etc. — wal-g handles compression
-	// internally based on the writer's configured method).
-	out := make([]string, 0, len(selected))
-	for _, k := range selected {
-		base := strings.TrimPrefix(k, listPrefix)
-		if dot := strings.IndexByte(base, '.'); dot > 0 {
-			base = base[:dot]
-		}
-		out = append(out, base)
+// walgSegmentName extracts the segment basename if `key` is a regular
+// WAL segment (exactly 24 hex chars, with a single compression extension).
+// Returns ok=false for .backup, .history, .partial, and any other
+// non-segment file types that share the wal_005/ prefix.
+func walgSegmentName(key, listPrefix string) (string, bool) {
+	base := strings.TrimPrefix(key, listPrefix)
+	// Strip the single compression extension (.br / .lzo / .gz / etc.)
+	if dot := strings.LastIndexByte(base, '.'); dot > 0 {
+		base = base[:dot]
 	}
-	sort.Strings(out) // deterministic order in the resulting Job's command line for log readability
-	return out, nil
+	if len(base) != 24 {
+		return "", false
+	}
+	for i := range base {
+		c := base[i]
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+			return "", false
+		}
+	}
+	return base, true
 }
