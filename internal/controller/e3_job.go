@@ -156,20 +156,33 @@ func (r *BackupRepositoryReconciler) e3CommandArgsEnv(
 		if len(samples) == 0 {
 			return nil, nil, nil, fmt.Errorf("no WAL segments to sample")
 		}
-		// Fetch each into a tmp file then delete; iterate. Use explicit
-		// `if !` instead of `set -e` + `&&` because dash (ubuntu's /bin/sh)
-		// silently continues on chain failures inside loops.
-		// Diagnostic prelude: echo WALG_* env so the pod log shows what
-		// wal-g actually inherits (caught a controller-vs-kubectl env
-		// mystery on 2026-04-29).
-		script := "echo 'wal-g E3 starting; compression='$WALG_COMPRESSION_METHOD; " +
-			"for s in " + strings.Join(samples, " ") + "; do " +
+		// Fetch each into a tmp file then delete; check file presence
+		// instead of $? because wal-g surfaces prefetcher noise via the
+		// exit code even when the foreground fetch produced a valid file.
+		//
+		// Each segment gets up to two attempts. wal-g's wal-fetch probes
+		// extensions in a fixed order (.gz first), and the CF tunnel in
+		// front of s3-arb returns 403 on the first HEAD of any missing
+		// key, then caches 404 for subsequent probes. wal-g treats 403
+		// as fatal and bails before reaching .br, so the first attempt
+		// reliably fails for every cold-cache key. Attempt 2 hits the
+		// cached 404, wal-g advances past .gz, finds the real .br.
+		// PostgreSQL recovery doesn't see this because it reads
+		// sequentially via the local prefetch cache; only random-sample
+		// fetches like E3 hit fresh keys every time.
+		script := "set +e; for s in " + strings.Join(samples, " ") + "; do " +
 			"  echo fetching $s; " +
-			"  if ! wal-g wal-fetch \"$s\" /tmp/seg; then " +
+			"  rm -f /tmp/seg; " +
+			"  for attempt in 1 2; do " +
+			"    wal-g wal-fetch \"$s\" /tmp/seg >/dev/null 2>&1; " +
+			"    [ -s /tmp/seg ] && break; " +
+			"    rm -f /tmp/seg; " +
+			"  done; " +
+			"  if [ ! -s /tmp/seg ]; then " +
 			"    echo FETCH_FAILED $s; exit 1; " +
 			"  fi; " +
-			"  rm -f /tmp/seg; " +
 			"done; " +
+			"rm -f /tmp/seg; " +
 			"echo OK " + fmt.Sprintf("%d", len(samples)) + " WAL segments verified"
 		return []string{"sh", "-c"}, []string{script}, baseEnv, nil
 
