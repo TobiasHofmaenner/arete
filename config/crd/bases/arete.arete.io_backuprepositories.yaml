@@ -42,11 +42,14 @@ spec:
     - jsonPath: .status.lastProbedAt
       name: Last Probed
       type: date
-    - jsonPath: .status.conditions[?(@.type=="ValidationHealthy")].status
-      name: Validation
-      type: string
     - jsonPath: .status.conditions[?(@.type=="MetadataValid")].status
-      name: Metadata
+      name: E2
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="SampledIntegrityValid")].status
+      name: E3
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="FullRetrievalCompleted")].status
+      name: E4
       type: string
     - jsonPath: .status.verifiedLastValidationAt
       name: Last Validated
@@ -82,12 +85,8 @@ spec:
       name: Budget
       priority: 1
       type: string
-    - jsonPath: .status.conditions[?(@.type=="SampledIntegrityValid")].status
-      name: Sampled
-      priority: 1
-      type: string
-    - jsonPath: .status.conditions[?(@.type=="FullRetrievalCompleted")].status
-      name: E4
+    - jsonPath: .status.conditions[?(@.type=="ValidationHealthy")].status
+      name: Validation
       priority: 1
       type: string
     - jsonPath: .status.lastFullRetrieval.throughputBytesPerSec

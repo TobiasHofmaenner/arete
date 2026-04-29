@@ -459,8 +459,15 @@ type BackupRepositoryStatus struct {
 // +kubebuilder:printcolumn:name="Last Backup",type=date,JSONPath=`.status.claimedLastSuccessfulBackup`
 // +kubebuilder:printcolumn:name="Backup Size",type=string,JSONPath=`.status.claimedLatestBackup.sizeBytes`
 // +kubebuilder:printcolumn:name="Last Probed",type=date,JSONPath=`.status.lastProbedAt`
-// +kubebuilder:printcolumn:name="Validation",type=string,JSONPath=`.status.conditions[?(@.type=="ValidationHealthy")].status`
-// +kubebuilder:printcolumn:name="Metadata",type=string,JSONPath=`.status.conditions[?(@.type=="MetadataValid")].status`
+// E2/E3/E4 columns surface each validation depth explicitly. A blank
+// cell means the layer isn't configured for this BR (e.g. no
+// sampledRetrievalInterval set → E3 doesn't run → empty cell). True
+// = last run passed; False = last run failed. The Health column
+// rolls up everything that IS configured; per-layer columns tell
+// you WHICH layers are running.
+// +kubebuilder:printcolumn:name="E2",type=string,JSONPath=`.status.conditions[?(@.type=="MetadataValid")].status`
+// +kubebuilder:printcolumn:name="E3",type=string,JSONPath=`.status.conditions[?(@.type=="SampledIntegrityValid")].status`
+// +kubebuilder:printcolumn:name="E4",type=string,JSONPath=`.status.conditions[?(@.type=="FullRetrievalCompleted")].status`
 // +kubebuilder:printcolumn:name="Last Validated",type=date,JSONPath=`.status.verifiedLastValidationAt`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:printcolumn:name="Detected",type=string,priority=1,JSONPath=`.status.detectedVersion`
@@ -470,8 +477,7 @@ type BackupRepositoryStatus struct {
 // +kubebuilder:printcolumn:name="Newest",type=date,priority=1,JSONPath=`.status.observedInventory.newestObject`
 // +kubebuilder:printcolumn:name="Bucket Security",type=string,priority=1,JSONPath=`.status.conditions[?(@.type=="BucketSecurityValid")].status`
 // +kubebuilder:printcolumn:name="Budget",type=string,priority=1,JSONPath=`.status.conditions[?(@.type=="SizeWithinBudget")].status`
-// +kubebuilder:printcolumn:name="Sampled",type=string,priority=1,JSONPath=`.status.conditions[?(@.type=="SampledIntegrityValid")].status`
-// +kubebuilder:printcolumn:name="E4",type=string,priority=1,JSONPath=`.status.conditions[?(@.type=="FullRetrievalCompleted")].status`
+// +kubebuilder:printcolumn:name="Validation",type=string,priority=1,JSONPath=`.status.conditions[?(@.type=="ValidationHealthy")].status`
 // +kubebuilder:printcolumn:name="E4 Throughput",type=integer,priority=1,JSONPath=`.status.lastFullRetrieval.throughputBytesPerSec`
 
 // BackupRepository declares an S3-backed backup location to be continuously
