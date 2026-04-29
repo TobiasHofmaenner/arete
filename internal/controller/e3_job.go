@@ -156,12 +156,17 @@ func (r *BackupRepositoryReconciler) e3CommandArgsEnv(
 		if len(samples) == 0 {
 			return nil, nil, nil, fmt.Errorf("no WAL segments to sample")
 		}
-		// Fetch each into a tmp file then delete; iterate. Exit non-zero
-		// at the first failure so the Job is marked Failed.
-		script := "set -e; for s in " + strings.Join(samples, " ") + "; do " +
-			"echo fetching $s; " +
-			"wal-g wal-fetch \"$s\" /tmp/seg && rm -f /tmp/seg; " +
-			"done; echo OK $(echo " + strings.Join(samples, " ") + " | wc -w) WAL segments verified"
+		// Fetch each into a tmp file then delete; iterate. Use explicit
+		// `if !` instead of `set -e` + `&&` because dash (ubuntu's /bin/sh)
+		// silently continues on chain failures inside loops.
+		script := "for s in " + strings.Join(samples, " ") + "; do " +
+			"  echo fetching $s; " +
+			"  if ! wal-g wal-fetch \"$s\" /tmp/seg; then " +
+			"    echo FETCH_FAILED $s; exit 1; " +
+			"  fi; " +
+			"  rm -f /tmp/seg; " +
+			"done; " +
+			"echo OK " + fmt.Sprintf("%d", len(samples)) + " WAL segments verified"
 		return []string{"sh", "-c"}, []string{script}, baseEnv, nil
 
 	case aretev1alpha1.BackupFormatRestic:

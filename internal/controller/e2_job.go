@@ -418,25 +418,37 @@ func credEnv(canonical, secretName string, mapping map[string]string, optional b
 
 // e2EnvFor returns the per-spec env vars (paths + region + endpoint) the
 // validator needs in addition to the credentialsSecret-mounted env vars.
+// Includes spec.s3.extraEnv pass-throughs (for things like
+// WALG_COMPRESSION_METHOD that the producer sets and the validator
+// must mirror).
 func e2EnvFor(spec aretev1alpha1.BackupRepositorySpec) []corev1.EnvVar {
+	var base []corev1.EnvVar
 	switch spec.Format {
 	case aretev1alpha1.BackupFormatWalg:
-		return []corev1.EnvVar{
+		base = []corev1.EnvVar{
 			{Name: "WALG_S3_PREFIX", Value: fmt.Sprintf("s3://%s/%s", spec.S3.Bucket, spec.S3.Prefix)},
 			{Name: "AWS_REGION", Value: spec.S3.Region},
 			{Name: "AWS_ENDPOINT", Value: spec.S3.Endpoint},
 			{Name: "AWS_S3_FORCE_PATH_STYLE", Value: "true"},
 		}
 	case aretev1alpha1.BackupFormatRestic:
-		// restic uses RESTIC_REPOSITORY for the path. The user's
-		// credentialsSecret should set RESTIC_PASSWORD plus AWS creds.
-		return []corev1.EnvVar{
+		base = []corev1.EnvVar{
 			{Name: "RESTIC_REPOSITORY",
 				Value: fmt.Sprintf("s3:%s/%s/%s", spec.S3.Endpoint, spec.S3.Bucket, spec.S3.Prefix)},
 			{Name: "AWS_REGION", Value: spec.S3.Region},
 		}
 	}
-	return nil
+	// Append extraEnv pass-throughs. Sorted for deterministic Job spec
+	// (avoids spurious diffs / Job-name churn between reconciles).
+	keys := make([]string, 0, len(spec.S3.ExtraEnv))
+	for k := range spec.S3.ExtraEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		base = append(base, corev1.EnvVar{Name: k, Value: spec.S3.ExtraEnv[k]})
+	}
+	return base
 }
 
 // readJobOutput pulls the last 20 lines of the Job's pod logs. Used to

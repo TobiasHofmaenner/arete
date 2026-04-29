@@ -301,6 +301,16 @@ spec:
                         https://minio.example.internal
                     pattern: ^https://.+
                     type: string
+                  extraEnv:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      extraEnv is a verbatim map of name → value env vars passed to
+                      validator Job containers. Use for non-secret configuration the
+                      validator binary needs that the producer also sets — e.g.
+                      WALG_COMPRESSION_METHOD=lzo when cnpg-plugin-wal-g writes lzo-
+                      compressed segments.
+                    type: object
                   prefix:
                     description: |-
                       prefix is the key prefix that scopes this repository within the bucket.

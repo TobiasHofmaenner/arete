@@ -90,6 +90,14 @@ type S3Source struct {
 	// +optional
 	AdditionalSecrets []SecretReference `json:"additionalSecrets,omitempty"`
 
+	// extraEnv is a verbatim map of name → value env vars passed to
+	// validator Job containers. Use for non-secret configuration the
+	// validator binary needs that the producer also sets — e.g.
+	// WALG_COMPRESSION_METHOD=lzo when cnpg-plugin-wal-g writes lzo-
+	// compressed segments.
+	// +optional
+	ExtraEnv map[string]string `json:"extraEnv,omitempty"`
+
 	// requireObjectLock asserts that the bucket must have S3 Object Lock
 	// configured. When true, BucketSecurityValid is False if the backend
 	// does not report Object Lock as enabled. Opt-in.
