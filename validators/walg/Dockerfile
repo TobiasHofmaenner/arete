@@ -15,15 +15,21 @@
 
 ARG WALG_VERSION=3.0.5
 
-FROM ubuntu:22.04 AS download
-ARG WALG_VERSION
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates && \
-    curl -fsSL -o /tmp/wal-g.tar.gz \
-        "https://github.com/wal-g/wal-g/releases/download/v${WALG_VERSION}/wal-g-pg-ubuntu-22.04-amd64.tar.gz" && \
-    tar -xzf /tmp/wal-g.tar.gz -C /tmp && \
-    mv /tmp/wal-g-pg-ubuntu-22.04-amd64 /tmp/wal-g && \
-    chmod +x /tmp/wal-g
+# Use the exact wal-g binary that cnpg-plugin-wal-g ships — same source
+# commit (94bf839) as the v3.0.5 GitHub release tarball, but built fresh
+# in their pipeline with current libsodium / Go toolchain. Binaries from
+# the GH release tarball (Jan 2025) and the cnpg-plugin build (Oct 2025)
+# diverged enough that decryption differs in subtle ways even though
+# both report the same version. Pinning to the producer's image
+# eliminates that drift.
+#
+# Note: this slightly rebrands the "always latest pinned" strategy from
+# ADR-023 — we track the cnpg-plugin-wal-g release rather than wal-g
+# upstream releases. Practically, since cnpg-plugin-wal-g IS what writes
+# the data we validate, matching it is the right choice. The forward-
+# compat canary still fires when the plugin bumps wal-g and the new
+# binary can't read repos written by older plugin versions.
+FROM ghcr.io/wal-g/cnpg-plugin-wal-g:0.2.2 AS walg-source
 
 FROM ubuntu:22.04
 ARG WALG_VERSION
@@ -39,7 +45,7 @@ RUN apt-get update && \
     # convention (distroless nonroot user).
     groupadd --gid 65532 nonroot && \
     useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
-COPY --from=download /tmp/wal-g /usr/local/bin/wal-g
+COPY --from=walg-source /usr/local/bin/wal-g /usr/local/bin/wal-g
 
 # Embed version metadata so `docker inspect` (and the controller, if it ever
 # wants to verify) can confirm what's inside without running the binary.
