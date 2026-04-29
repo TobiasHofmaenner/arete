@@ -256,9 +256,17 @@ func (r *BackupRepositoryReconciler) applyStatus(
 	br.Status.ObservedGeneration = br.Generation
 	br.Status.DetectedFormat = p.DetectedFormat
 	br.Status.DetectedVersion = p.DetectedVersion
-	// E1 owns claimedLastSuccessfulBackup (the timestamp). claimedLatestBackup
-	// (full per-backup detail) is owned by E2 — see ingestion below.
 	br.Status.ClaimedLastSuccessfulBackup = p.LastSuccessfulBackup
+
+	// Per-format ownership of claimedLatestBackup:
+	//   - wal-g: E1 owns it (sentinels are plaintext). probe.LatestBackup
+	//     is non-nil for wal-g — write through every cycle.
+	//   - restic: E2 owns it. probe.LatestBackup is nil for restic; E2's
+	//     Job result populates it. Keep stale value on cycles without a
+	//     new E2 result so the dashboard doesn't blink to nil.
+	if p.LatestBackup != nil {
+		br.Status.ClaimedLatestBackup = p.LatestBackup
+	}
 
 	// Ingest any newly-completed E2 result into status.
 	var metadataValid *metav1.Condition
@@ -266,10 +274,12 @@ func (r *BackupRepositoryReconciler) applyStatus(
 		metadataValid = e2.completedResult
 		t := metav1.NewTime(*e2.completedAt)
 		br.Status.VerifiedLastValidationAt = &t
-		// claimedLatestBackup is overwritten with E2's view (or cleared
-		// to nil if E2 didn't produce one) so its recency is always the
-		// E2 cadence, never a stale mix of E1 and E2 data.
-		br.Status.ClaimedLatestBackup = e2.latestBackup
+		// E2-owned formats (restic) overwrite claimedLatestBackup from
+		// the validator output. E1-owned formats (wal-g) leave E2's nil
+		// alone — the E1 write above already set the field.
+		if e2.latestBackup != nil {
+			br.Status.ClaimedLatestBackup = e2.latestBackup
+		}
 	} else if br.Status.VerifiedLastValidationAt != nil {
 		// No new result this cycle — preserve previous condition.
 		if existing := apimeta.FindStatusCondition(br.Status.Conditions,

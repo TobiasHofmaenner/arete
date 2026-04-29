@@ -28,76 +28,21 @@ import (
 )
 
 // parseE2Output extracts a LatestBackupStatus from the validator pod's
-// stdout. Each format's E2 command emits a structured JSON line for the
-// most recent backup; we scan the captured logs for it. Best-effort —
-// returns nil if the output is empty or malformed (the condition's
-// success state is set by the caller from the Job exit code).
+// stdout. Per-format ownership of claimedLatestBackup means only formats
+// whose E2 owns the field have a parser here:
+//   - wal-g: NOT here — E1 sentinel parsing owns the field
+//     (sentinels are plaintext + cheap to read).
+//   - restic: here — E1 can't see beyond encrypted file timestamps,
+//     so E2 parses `restic snapshots --json` for the full detail.
+//
+// Best-effort: returns nil if the output is missing or malformed
+// (MetadataValid success/failure is independently set from exit code).
 func parseE2Output(format aretev1alpha1.BackupFormat, logs string) *aretev1alpha1.LatestBackupStatus {
 	switch format {
-	case aretev1alpha1.BackupFormatWalg:
-		return parseWalgBackupListJSON(logs)
 	case aretev1alpha1.BackupFormatRestic:
 		return parseResticSnapshotsJSON(logs)
 	}
 	return nil
-}
-
-// --- wal-g ---
-
-// walgBackupListEntry mirrors one element of `wal-g backup-list --detail
-// --json`'s output. Only the fields we actually use; wal-g's struct has
-// many more (LSN markers, system identifier, etc.).
-type walgBackupListEntry struct {
-	BackupName       string `json:"backup_name"`
-	Time             string `json:"time"` // RFC3339-ish
-	StartTime        string `json:"start_time"`
-	FinishTime       string `json:"finish_time"`
-	CompressedSize   int64  `json:"compressed_size"`
-	UncompressedSize int64  `json:"uncompressed_size"`
-}
-
-func parseWalgBackupListJSON(logs string) *aretev1alpha1.LatestBackupStatus {
-	var entries []walgBackupListEntry
-	if !findAndUnmarshalJSON(logs, '[', &entries) || len(entries) == 0 {
-		return nil
-	}
-	// Pick the latest by FinishTime (fall back to Time then list order).
-	latest := entries[len(entries)-1]
-	for _, e := range entries {
-		if compareWalgTimes(e.finishOrTime(), latest.finishOrTime()) > 0 {
-			latest = e
-		}
-	}
-	createdAt := parseWalgTime(latest.finishOrTime(), time.Time{})
-	out := &aretev1alpha1.LatestBackupStatus{
-		Name:      latest.BackupName,
-		CreatedAt: metav1.NewTime(createdAt),
-		SizeBytes: *resource.NewQuantity(latest.CompressedSize, resource.BinarySI),
-	}
-	if latest.UncompressedSize > 0 {
-		uq := resource.NewQuantity(latest.UncompressedSize, resource.BinarySI)
-		out.UncompressedSizeBytes = uq
-	}
-	return out
-}
-
-func (e walgBackupListEntry) finishOrTime() string {
-	if e.FinishTime != "" {
-		return e.FinishTime
-	}
-	return e.Time
-}
-
-func compareWalgTimes(a, b string) int {
-	ta := parseWalgTime(a, time.Time{})
-	tb := parseWalgTime(b, time.Time{})
-	switch {
-	case ta.After(tb):
-		return 1
-	case ta.Before(tb):
-		return -1
-	}
-	return 0
 }
 
 // --- restic ---

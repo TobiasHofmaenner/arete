@@ -293,20 +293,21 @@ func (r *BackupRepositoryReconciler) validatorImageFor(format aretev1alpha1.Back
 // for E2 validation. Both wal-g and restic images have the format binary
 // as their ENTRYPOINT, so we only need to supply the subcommand + flags.
 //
-// Each command emits structured JSON for the most-recent backup detail
-// — the controller parses it on Job completion and populates
-// claimedLatestBackup. See e2_output.go for the parsers.
+// claimedLatestBackup population is per-format:
+//   - wal-g: owned by E1 sentinel parsing (sentinels are plaintext).
+//     E2 just runs `backup-list` for the exit code → MetadataValid.
+//   - restic: owned by E2 here — `restic snapshots --json` emits
+//     structured per-snapshot detail the controller parses. See
+//     e2_output.go.
 func e2ArgsFor(format aretev1alpha1.BackupFormat) []string {
 	switch format {
 	case aretev1alpha1.BackupFormatWalg:
-		// E2 = metadata + per-backup detail. backup-list --detail --json
-		// enumerates the catalog AND emits per-backup struct (size,
-		// timestamps, name) the controller parses for claimedLatestBackup.
-		//
-		// `wal-g wal-verify integrity/timeline` intentionally NOT here:
-		// those subcommands require a live Postgres connection (current
-		// LSN/timeline). Deeper WAL chain checks belong in E3 + L2.
-		return []string{"backup-list", "--detail", "--json"}
+		// `backup-list` exit code proves catalog is decryptable + parseable.
+		// `--detail --json` combo silently produces no output in wal-g
+		// 3.0.5; per-backup detail comes from E1 sentinel parsing instead.
+		// `wal-verify integrity/timeline` intentionally NOT here — they
+		// require a live Postgres connection (current LSN/timeline).
+		return []string{"backup-list"}
 	case aretev1alpha1.BackupFormatRestic:
 		// `restic check` validates index/data integrity (returns exit 0
 		// on success). Then `restic snapshots --json` emits the snapshot

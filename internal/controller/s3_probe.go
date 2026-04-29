@@ -29,6 +29,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -62,15 +63,20 @@ type probeResult struct {
 	BucketSecurityReason  string
 	BucketSecurityMessage string
 
-	// Producer-claimed metadata. Only the load-bearing fields E1 can
-	// populate cheaply: the most recent backup's timestamp (drives the
-	// BackupCurrent condition) and detected format/version strings.
-	// Rich per-backup detail (size, paths, hostname) lives in
-	// claimedLatestBackup, populated by E2 at the slower validation
-	// cadence — keeping recency consistent within each substruct.
+	// Producer-claimed metadata. Per-format ownership of claimedLatestBackup
+	// (see ADR-023 / project_arete_pass3_status_additions memory):
+	//   - wal-g: E1 sentinel parsing OWNS the full LatestBackup struct
+	//     (sentinels are plaintext; size + timestamp + name all available
+	//     here for free). E2 doesn't touch it.
+	//   - restic: E2 `restic snapshots --json` OWNS the full struct
+	//     (everything's encrypted, E1 can't see beyond LastModified).
+	//     E1 only sets LastSuccessfulBackup (timestamp) for BackupCurrent.
+	// LastSuccessfulBackup is set by E1 for both formats — the load-bearing
+	// timestamp for BackupCurrent.
 	DetectedFormat       string
 	DetectedVersion      string
 	LastSuccessfulBackup *metav1.Time
+	LatestBackup         *aretev1alpha1.LatestBackupStatus // wal-g only at E1; nil for restic
 }
 
 // probeRepository runs one E1 cycle. Pure function over (spec, creds) — no
@@ -107,12 +113,14 @@ func probeRepository(
 	result.BucketSecurityReason = secReason
 	result.BucketSecurityMessage = secMsg
 
-	// Phase 3: format-aware sentinel parse (extracts version + last
-	// successful backup timestamp; rich detail is E2's job).
-	format, version, lastSuccess := detectFormatAndTimestamp(ctx, client, spec)
+	// Phase 3: format-aware sentinel parse. wal-g returns full latestBackup
+	// (sentinel is plaintext); restic returns only the timestamp (everything
+	// else needs decryption — that's E2's job).
+	format, version, lastSuccess, latest := detectFormatAndTimestamp(ctx, client, spec)
 	result.DetectedFormat = format
 	result.DetectedVersion = version
 	result.LastSuccessfulBackup = lastSuccess
+	result.LatestBackup = latest
 
 	return result
 }
@@ -229,27 +237,31 @@ func classifyS3Error(err error) (string, string) {
 	return aretev1alpha1.ReasonS3Unreachable, err.Error()
 }
 
-// detectFormatAndTimestamp does a format-specific lookup for the producer
-// version + the most recent successful backup's timestamp (drives the
-// BackupCurrent condition). Per-backup detail (size/paths) is E2's job
-// — populated at the slower validation cadence so claimedLatestBackup's
-// recency stays consistent across all its fields.
+// detectFormatAndTimestamp does a format-specific lookup. Returns the
+// detected format + version, the most recent successful backup's
+// timestamp (drives BackupCurrent), and — for formats whose E1 can
+// produce it — the full LatestBackup struct.
+//
+// Per-format ownership of claimedLatestBackup:
+//   - wal-g: E1 owns it (sentinel is plaintext)
+//   - restic: E2 owns it (E1 can only see encrypted file timestamps)
+//   - barman: deferred
 func detectFormatAndTimestamp(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
-) (format string, version string, lastSuccess *metav1.Time) {
+) (format string, version string, lastSuccess *metav1.Time, latest *aretev1alpha1.LatestBackupStatus) {
 	switch spec.Format {
 	case aretev1alpha1.BackupFormatWalg:
-		v, t := readWalgSentinelTimestamp(ctx, client, spec)
-		return "walg", v, t
+		v, t, l := readWalgSentinel(ctx, client, spec)
+		return "walg", v, t, l
 	case aretev1alpha1.BackupFormatRestic:
 		// detectedVersion stays empty for restic at E1 — restic encrypts
 		// the config file, so version determination requires E2.
-		return "restic", "", readResticLatestSnapshotTime(ctx, client, spec)
+		// LatestBackup nil here; E2 populates it from `restic snapshots`.
+		return "restic", "", readResticLatestSnapshotTime(ctx, client, spec), nil
 	case aretev1alpha1.BackupFormatBarman:
-		// Barman sentinel parsing not implemented yet.
-		return "barman", "", nil
+		return "barman", "", nil, nil
 	}
-	return "", "", nil
+	return "", "", nil, nil
 }
 
 // --- wal-g ---
@@ -262,22 +274,29 @@ func detectFormatAndTimestamp(
 // closest forward-compat signal we can surface from E1 is the
 // (sentinel-format, postgres-version) tuple — actual wal-g binary
 // compatibility is enforced by E2 (where arete's pinned validator either
-// parses the repo or doesn't). Per-backup size + name now come from E2
-// (`wal-g backup-list --detail --json`) so they live in claimedLatestBackup
-// alongside the same fields populated for restic, with consistent recency.
+// parses the repo or doesn't).
+//
+// Wal-g sentinels are PLAINTEXT (encryption applies to basebackup data
+// + WAL segments only). So E1 owns the full claimedLatestBackup struct
+// for wal-g — name from the sentinel filename pattern, size + timestamp
+// from the JSON body. E2 doesn't touch claimedLatestBackup for wal-g.
 type walgSentinel struct {
-	Version    int    `json:"Version"`   // sentinel format version (e.g. 2)
-	PgVersion  int    `json:"PgVersion"` // packed: 160008 = "16.0.8"
-	FinishTime string `json:"FinishTime"`
+	Version          int    `json:"Version"`   // sentinel format version (e.g. 2)
+	PgVersion        int    `json:"PgVersion"` // packed: 160008 = "16.0.8"
+	FinishTime       string `json:"FinishTime"`
+	CompressedSize   int64  `json:"CompressedSize"`
+	UncompressedSize int64  `json:"UncompressedSize"`
 }
 
-// readWalgSentinelTimestamp returns the detected version string and the
-// FinishTime of the most-recent basebackup sentinel — the load-bearing
-// timestamp that drives the BackupCurrent condition. Per-backup detail
-// (name/size) is E2's job.
-func readWalgSentinelTimestamp(
+// readWalgSentinel parses the most-recent backup_stop_sentinel.json under
+// <prefix>/basebackups_005/ to extract:
+//   - detected version string (sentinel-vN/pg-X.Y.Z)
+//   - claimedLastSuccessfulBackup timestamp (load-bearing for BackupCurrent)
+//   - full claimedLatestBackup struct (name from filename, size + time
+//     from sentinel JSON)
+func readWalgSentinel(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
-) (string, *metav1.Time) {
+) (string, *metav1.Time, *aretev1alpha1.LatestBackupStatus) {
 	log := logf.FromContext(ctx)
 	const suffix = "_backup_stop_sentinel.json"
 
@@ -297,36 +316,51 @@ func readWalgSentinelTimestamp(
 	}) {
 		if obj.Err != nil {
 			log.Error(obj.Err, "walg sentinel hunt list error")
-			return "", nil
+			return "", nil, nil
 		}
 		if strings.HasSuffix(obj.Key, suffix) {
 			sentinels = append(sentinels, obj)
 		}
 	}
 	if len(sentinels) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
-	// Pick the most recent sentinel — reflects the version that wrote the
-	// latest backup, which is what we want to compare to arete's validator.
+	// Pick the most recent sentinel.
 	sort.Slice(sentinels, func(i, j int) bool {
 		return sentinels[i].LastModified.After(sentinels[j].LastModified)
 	})
+	latestKey := sentinels[0].Key
 
-	body, err := getObjectBody(ctx, client, spec.S3.Bucket, sentinels[0].Key)
+	body, err := getObjectBody(ctx, client, spec.S3.Bucket, latestKey)
 	if err != nil {
-		log.Error(err, "walg sentinel GET failed", "key", sentinels[0].Key)
-		return "", nil
+		log.Error(err, "walg sentinel GET failed", "key", latestKey)
+		return "", nil, nil
 	}
 	var s walgSentinel
 	if err := json.Unmarshal(body, &s); err != nil {
-		log.Error(err, "walg sentinel JSON parse failed", "key", sentinels[0].Key)
-		return "", nil
+		log.Error(err, "walg sentinel JSON parse failed", "key", latestKey)
+		return "", nil, nil
 	}
 
 	version := fmt.Sprintf("sentinel-v%d/pg-%s", s.Version, formatPgVersion(s.PgVersion))
 	createdAt := parseWalgTime(s.FinishTime, sentinels[0].LastModified)
-	t := metav1.NewTime(createdAt)
-	return version, &t
+	ts := metav1.NewTime(createdAt)
+
+	// backup_name is the sentinel filename minus the path + suffix:
+	//   basebackups_005/base_<wal-lsn>_backup_stop_sentinel.json
+	//   →  base_<wal-lsn>
+	name := strings.TrimSuffix(strings.TrimPrefix(latestKey, listPrefix), suffix)
+
+	latest := &aretev1alpha1.LatestBackupStatus{
+		Name:      name,
+		CreatedAt: ts,
+		SizeBytes: *resource.NewQuantity(s.CompressedSize, resource.BinarySI),
+	}
+	if s.UncompressedSize > 0 {
+		uq := resource.NewQuantity(s.UncompressedSize, resource.BinarySI)
+		latest.UncompressedSizeBytes = uq
+	}
+	return version, &ts, latest
 }
 
 // parseWalgTime parses wal-g's time format (RFC3339-ish with microseconds)
