@@ -321,13 +321,16 @@ func e2ArgsFor(format aretev1alpha1.BackupFormat) []string {
 func e2CommandFor(format aretev1alpha1.BackupFormat) []string {
 	switch format {
 	case aretev1alpha1.BackupFormatRestic:
-		// restic image ENTRYPOINT is `restic`; we need to override with
-		// a shell to chain check + snapshots --json.
-		// Setting RESTIC_CACHE_DIR=/tmp because the image's nonroot
-		// user has no writable home for the default cache location.
+		// restic image ENTRYPOINT is `restic`; override with a shell to
+		// chain check + snapshots --json. RESTIC_CACHE_DIR=/tmp because
+		// the image's nonroot user has no writable home. --retry-lock
+		// queues if E3 (or another job) is holding the exclusive lock
+		// — without it, simultaneous restic Jobs on the same repo
+		// fail-fast with "stale lock" errors.
 		return []string{"sh", "-c",
 			"export RESTIC_CACHE_DIR=/tmp && " +
-				"restic check && restic snapshots --json"}
+				"restic --retry-lock 60s check && " +
+				"restic --retry-lock 60s snapshots --json"}
 	}
 	return nil
 }

@@ -173,10 +173,11 @@ func (r *BackupRepositoryReconciler) e3CommandArgsEnv(
 		// restic --read-data-subset accepts size-bytes form; approximate
 		// `target` packs as `target * 16M` (typical pack size). Bounded
 		// cost; restic picks packs randomly until it hits the byte cap.
+		// --retry-lock to queue if E2 holds the exclusive repo lock.
 		approxBytes := target * 16
 		subset := fmt.Sprintf("%dM", approxBytes)
 		script := "export RESTIC_CACHE_DIR=/tmp && " +
-			"restic check --read-data-subset " + subset
+			"restic --retry-lock 60s check --read-data-subset " + subset
 		return []string{"sh", "-c"}, []string{script}, baseEnv, nil
 	}
 	return nil, nil, nil, fmt.Errorf("E3 not implemented for format %q", br.Spec.Format)
