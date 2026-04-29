@@ -86,6 +86,17 @@ certmanager:
 networkPolicy:
   enable: false
 
+# BackupRepositoryConditional materializes arbitrary K8s resources
+# (cnpg Clusters, Helm releases, Jobs, etc.) based on backup-repo
+# state. The controller needs cluster-wide write permissions on every
+# GVK its variants reference. List those here so the chart's
+# ClusterRole grants matching rules; users with more variant kinds
+# extend this list.
+backupRepositoryConditional:
+  childResourceTargets:
+    - apiGroups: ["postgresql.cnpg.io"]
+      resources: ["clusters"]
+
 # [VALIDATOR IMAGES]: Per-format images the controller spawns as Jobs for
 # E2 metadata validation, E3 sampled retrieval, and E4 full retrieval.
 #

@@ -3,7 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/arete.arete.io_backuprepositories.yaml
-- bases/arete.arete.io_conditionalconfigs.yaml
+- bases/arete.arete.io_backuprepositoryconditionals.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

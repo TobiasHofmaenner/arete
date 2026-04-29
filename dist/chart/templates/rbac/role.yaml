@@ -10,6 +10,14 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - persistentvolumeclaims
   verbs:
   - create
@@ -36,7 +44,7 @@ rules:
   - arete.arete.io
   resources:
   - backuprepositories
-  - conditionalconfigs
+  - backuprepositoryconditionals
   verbs:
   - create
   - delete
@@ -49,14 +57,14 @@ rules:
   - arete.arete.io
   resources:
   - backuprepositories/finalizers
-  - conditionalconfigs/finalizers
+  - backuprepositoryconditionals/finalizers
   verbs:
   - update
 - apiGroups:
   - arete.arete.io
   resources:
   - backuprepositories/status
-  - conditionalconfigs/status
+  - backuprepositoryconditionals/status
   verbs:
   - get
   - patch
@@ -71,4 +79,26 @@ rules:
   - get
   - list
   - watch
+{{- /*
+  childResourceTargets: list of GVK rules granting the controller
+  permission to materialize child manifests via
+  BackupRepositoryConditional. Each entry is a ClusterRole rule
+  (apiGroups + resources). Defaults to cnpg Cluster — the only
+  target type used today. Extend in chart values when adding new
+  variant kinds.
+*/ -}}
+{{- range .Values.backupRepositoryConditional.childResourceTargets }}
+- apiGroups:
+{{ toYaml .apiGroups | indent 2 }}
+  resources:
+{{ toYaml .resources | indent 2 }}
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+{{- end }}
 {{- end -}}
