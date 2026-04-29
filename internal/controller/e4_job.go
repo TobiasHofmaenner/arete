@@ -260,7 +260,7 @@ func (r *BackupRepositoryReconciler) e4CommandArgsEnv(
 // Returns nil if no STATS line is present (validator died before emitting).
 func parseE4Stats(logs string) *aretev1alpha1.FullRetrievalStatus {
 	var statsLine string
-	for _, line := range strings.Split(logs, "\n") {
+	for line := range strings.SplitSeq(logs, "\n") {
 		t := strings.TrimSpace(line)
 		if strings.HasPrefix(t, "STATS ") {
 			statsLine = t
@@ -270,7 +270,7 @@ func parseE4Stats(logs string) *aretev1alpha1.FullRetrievalStatus {
 		return nil
 	}
 	fields := map[string]int64{}
-	for _, tok := range strings.Fields(strings.TrimPrefix(statsLine, "STATS ")) {
+	for tok := range strings.FieldsSeq(strings.TrimPrefix(statsLine, "STATS ")) {
 		kv := strings.SplitN(tok, "=", 2)
 		if len(kv) != 2 {
 			continue

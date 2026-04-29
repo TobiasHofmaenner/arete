@@ -166,12 +166,16 @@ func (r *BackupRepositoryConditionalReconciler) Reconcile(
 		return ctrl.Result{}, r.Status().Patch(ctx, &brc, patch)
 	}
 
-	// 7. Server-side apply with a stable field manager. ForceOwnership
-	//    so re-reconciles after a manifest edit overwrite previous
-	//    fields owned by us.
-	if err := r.Patch(ctx, &obj, client.Apply,
-		client.FieldOwner(brConditionalFieldManager),
-		client.ForceOwnership,
+	// 7. Server-side apply with a stable field manager. Force=true so
+	//    re-reconciles after a manifest edit overwrite previous fields
+	//    owned by us. The ApplyConfigurationFromUnstructured helper
+	//    converts our parsed unstructured.Unstructured into the typed
+	//    runtime.ApplyConfiguration the new client.Apply API expects.
+	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(&obj),
+		&client.ApplyOptions{
+			FieldManager: brConditionalFieldManager,
+			Force:        ptrBool(true),
+		},
 	); err != nil {
 		// Special-case immutable conflicts: cnpg's bootstrap.* is
 		// immutable after creation, so a state flip after first apply
