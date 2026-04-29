@@ -333,36 +333,72 @@ func e2CommandFor(format aretev1alpha1.BackupFormat) []string {
 }
 
 // credentialEnvVars returns the env vars the validator needs from the
-// credentialsSecret. Each entry uses valueFrom.secretKeyRef so the
+// credentialsSecret(s). Each entry uses valueFrom.secretKeyRef so the
 // validator receives the canonical name (AWS_ACCESS_KEY_ID etc.) even
 // if the source Secret stores the value under a different key (per
 // spec.s3.credentialsSecret.keyMapping).
 //
+// Multi-secret resolution: for each canonical name, the primary
+// credentialsSecret is checked first; if no keyMapping covers it AND
+// the canonical key isn't there, fall through to additionalSecrets in
+// order. The first match wins. (We can't query Secret contents from
+// here — that's evaluated at Job-pod startup. So we use the keyMapping
+// presence as the routing signal: if mapping[canonical] is set, that
+// Secret owns the var. If no mapping and canonical isn't found in
+// primary, use the first additional Secret that maps it.)
+//
 // Optional flags (AWS_SESSION_TOKEN, etc.) are marked optional=true so
 // the Job doesn't fail to start when they're absent. Required vars
 // (AWS_*, RESTIC_PASSWORD for restic) are NOT optional — the binary
-// will fail loudly if they're missing, which is what we want under the
+// fails loudly if they're missing, which is what we want under the
 // strict contract.
 func credentialEnvVars(spec aretev1alpha1.BackupRepositorySpec) []corev1.EnvVar {
-	mapping := spec.S3.CredentialsSecret.KeyMapping
-	secretName := spec.S3.CredentialsSecret.Name
-	out := []corev1.EnvVar{
-		credEnv("AWS_ACCESS_KEY_ID", secretName, mapping, false),
-		credEnv("AWS_SECRET_ACCESS_KEY", secretName, mapping, false),
-		credEnv("AWS_SESSION_TOKEN", secretName, mapping, true),
+	canonicals := []struct {
+		name     string
+		optional bool
+	}{
+		{"AWS_ACCESS_KEY_ID", false},
+		{"AWS_SECRET_ACCESS_KEY", false},
+		{"AWS_SESSION_TOKEN", true},
 	}
 	switch spec.Format {
 	case aretev1alpha1.BackupFormatWalg:
 		// Required for E3/E4 against encrypted repos. Optional at E2:
 		// `wal-g backup-list` reads plaintext sentinels and works
 		// without it.
-		out = append(out, credEnv("WALG_LIBSODIUM_KEY", secretName, mapping, true))
+		canonicals = append(canonicals, struct {
+			name     string
+			optional bool
+		}{"WALG_LIBSODIUM_KEY", true})
 	case aretev1alpha1.BackupFormatRestic:
-		// Required for any restic operation against an encrypted repo
-		// (which all restic repos are).
-		out = append(out, credEnv("RESTIC_PASSWORD", secretName, mapping, false))
+		canonicals = append(canonicals, struct {
+			name     string
+			optional bool
+		}{"RESTIC_PASSWORD", false})
+	}
+
+	out := make([]corev1.EnvVar, 0, len(canonicals))
+	for _, c := range canonicals {
+		out = append(out, resolveCredEnv(c.name, c.optional, spec.S3))
 	}
 	return out
+}
+
+// resolveCredEnv finds which Secret should source a given canonical name
+// and builds the env var. Walks credentialsSecret first (primary), then
+// additionalSecrets in order. Routing uses the keyMapping presence: if a
+// Secret explicitly maps the canonical name, that Secret owns it. If no
+// Secret maps it, the canonical name is sourced from the primary using
+// identity (the binary fails loudly if the key isn't there and it's
+// required — strict contract).
+func resolveCredEnv(canonical string, optional bool, src aretev1alpha1.S3Source) corev1.EnvVar {
+	for _, ref := range append([]aretev1alpha1.SecretReference{src.CredentialsSecret}, src.AdditionalSecrets...) {
+		if _, mapped := ref.KeyMapping[canonical]; mapped {
+			return credEnv(canonical, ref.Name, ref.KeyMapping, optional)
+		}
+	}
+	// Nobody mapped it — fall back to identity on the primary.
+	return credEnv(canonical, src.CredentialsSecret.Name, src.CredentialsSecret.KeyMapping, optional)
 }
 
 // credEnv builds a single env var sourced from a Secret key, applying

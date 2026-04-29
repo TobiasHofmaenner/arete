@@ -74,10 +74,21 @@ type S3Source struct {
 	// +required
 	Prefix string `json:"prefix"`
 
-	// credentialsSecret references a Secret containing AWS_ACCESS_KEY_ID
-	// and AWS_SECRET_ACCESS_KEY keys. Cluster-scoped CR requires namespace.
+	// credentialsSecret references the primary Secret with at least
+	// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (use keyMapping if your
+	// Secret stores them under different names). Cluster-scoped CR
+	// requires namespace.
 	// +required
 	CredentialsSecret SecretReference `json:"credentialsSecret"`
+
+	// additionalSecrets supplies extra credential env vars sourced from
+	// further Secrets — useful when format-specific encryption keys live
+	// separately from the AWS auth Secret (e.g. cnpg-plugin-wal-g splits
+	// nextcloud-s3 from nextcloud-walg-encryption). Each entry follows
+	// the same SecretReference shape with optional keyMapping. Canonical
+	// names already supplied by credentialsSecret take precedence.
+	// +optional
+	AdditionalSecrets []SecretReference `json:"additionalSecrets,omitempty"`
 
 	// requireObjectLock asserts that the bucket must have S3 Object Lock
 	// configured. When true, BucketSecurityValid is False if the backend
@@ -411,9 +422,15 @@ type BackupRepositoryStatus struct {
 	ObservedGrowth *GrowthStatus `json:"observedGrowth,omitempty"`
 
 	// verifiedLastValidationAt is when the most recent successful E2 run
-	// completed. Stays nil until 3c (E2 Jobs) ships.
+	// completed.
 	// +optional
 	VerifiedLastValidationAt *metav1.Time `json:"verifiedLastValidationAt,omitempty"`
+
+	// verifiedLastSampledRetrievalAt is when the most recent E3 sampled
+	// retrieval Job completed (success or failure — separate condition
+	// SampledIntegrityValid carries the outcome).
+	// +optional
+	VerifiedLastSampledRetrievalAt *metav1.Time `json:"verifiedLastSampledRetrievalAt,omitempty"`
 
 	// lastFullRetrieval is the result of the most recent E4 Job. Stays nil
 	// until E4 has been enabled and run at least once.

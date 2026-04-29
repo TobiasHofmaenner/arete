@@ -88,7 +88,10 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// E2 Job lifecycle: process any completed Job, maybe spawn a new one
 	e2 := r.processE2(ctx, &br)
 
-	if err := r.applyStatus(ctx, &br, probe, e2); err != nil {
+	// E3 Job lifecycle: opt-in via spec.sampledRetrievalInterval
+	e3 := r.processE3(ctx, &br, creds)
+
+	if err := r.applyStatus(ctx, &br, probe, e2, e3); err != nil {
 		log.Error(err, "failed to update status")
 		return ctrl.Result{}, err
 	}
@@ -104,6 +107,16 @@ type e2Outcome struct {
 	completedResult *metav1.Condition                 // nil if no new completed job to process
 	completedAt     *time.Time                        // nil if completedResult is nil
 	latestBackup    *aretev1alpha1.LatestBackupStatus // nil if validator didn't emit JSON or parse failed
+}
+
+// e3Outcome mirrors e2Outcome for the sampled retrieval level.
+// LatestSampleAt is the controller's running record of "when did the
+// last E3 run finish" — distinct from VerifiedLastValidationAt (E2's
+// scope). Lives in status.verifiedLastSampledRetrievalAt.
+type e3Outcome struct {
+	jobActive       bool
+	completedResult *metav1.Condition
+	completedAt     *time.Time
 }
 
 // processE2 inspects existing E2 Jobs for this BR, ingests results from
@@ -148,6 +161,69 @@ func (r *BackupRepositoryReconciler) processE2(
 	}
 
 	return out
+}
+
+// processE3 mirrors processE2 for sampled retrieval. Skipped entirely
+// when the level is not enabled (sampledRetrievalInterval nil) — the
+// SampledIntegrityValid condition stays absent or stale-True from the
+// previous run.
+func (r *BackupRepositoryReconciler) processE3(
+	ctx context.Context, br *aretev1alpha1.BackupRepository, creds S3Credentials,
+) e3Outcome {
+	log := logf.FromContext(ctx)
+	out := e3Outcome{}
+	if br.Spec.SampledRetrievalInterval == nil {
+		return out
+	}
+
+	jobs, err := r.listE3Jobs(ctx, br)
+	if err != nil {
+		log.Error(err, "list e3 jobs")
+		return out
+	}
+
+	if active := firstActiveJob(jobs); active != nil {
+		out.jobActive = true
+	}
+
+	if latest := pickLatestCompletedJob(jobs); latest != nil {
+		completedAt := jobCompletionTime(latest)
+		alreadyIngested := br.Status.VerifiedLastSampledRetrievalAt != nil &&
+			!completedAt.After(br.Status.VerifiedLastSampledRetrievalAt.Time)
+		if !alreadyIngested {
+			out.completedResult = r.ingestE3Result(ctx, latest)
+			out.completedAt = &completedAt
+		}
+	}
+
+	if !out.jobActive && shouldSpawnE3(br, br.Status.VerifiedLastSampledRetrievalAt, time.Now()) {
+		if _, err := r.spawnE3Job(ctx, br, creds); err != nil {
+			log.Error(err, "spawn e3 job")
+		} else {
+			out.jobActive = true
+			log.Info("spawned E3 job", "format", br.Spec.Format)
+		}
+	}
+
+	return out
+}
+
+// ingestE3Result turns a finished E3 Job into a SampledIntegrityValid
+// condition. Exit 0 → True; otherwise False with the last log line.
+func (r *BackupRepositoryReconciler) ingestE3Result(
+	ctx context.Context, job *batchv1.Job,
+) *metav1.Condition {
+	logs := r.readJobOutput(ctx, job)
+	if !jobSucceeded(job) {
+		return condFalse(
+			aretev1alpha1.ReasonSampledIntegrityFailed,
+			fmt.Sprintf("sampled retrieval failed; last log: %s", lastLine(logs)),
+		)
+	}
+	return condTrue(
+		aretev1alpha1.ReasonProbeSucceeded,
+		fmt.Sprintf("sampled retrieval ok; last log: %s", lastLine(logs)),
+	)
 }
 
 // ingestE2Result turns a finished Job into a (MetadataValid condition,
@@ -255,10 +331,10 @@ func (r *BackupRepositoryReconciler) recordCredentialsFailure(
 }
 
 // applyStatus computes every condition and updates the structured status
-// fields from the probe + e2 outcomes, then patches the BackupRepository.
+// fields from the probe + e2 + e3 outcomes, then patches the BackupRepository.
 func (r *BackupRepositoryReconciler) applyStatus(
 	ctx context.Context, br *aretev1alpha1.BackupRepository,
-	p probeResult, e2 e2Outcome,
+	p probeResult, e2 e2Outcome, e3 e3Outcome,
 ) error {
 	patch := client.MergeFrom(br.DeepCopy())
 	now := metav1.Now()
@@ -301,13 +377,30 @@ func (r *BackupRepositoryReconciler) applyStatus(
 		}
 	}
 
+	// Ingest E3 result.
+	var sampledIntegrityValid *metav1.Condition
+	if e3.completedResult != nil {
+		sampledIntegrityValid = e3.completedResult
+		t := metav1.NewTime(*e3.completedAt)
+		br.Status.VerifiedLastSampledRetrievalAt = &t
+	} else if br.Status.VerifiedLastSampledRetrievalAt != nil {
+		if existing := apimeta.FindStatusCondition(br.Status.Conditions,
+			aretev1alpha1.ConditionSampledIntegrityValid); existing != nil &&
+			existing.Reason != aretev1alpha1.ReasonLayerTwoNotYetAvailable {
+			c := *existing
+			sampledIntegrityValid = &c
+		}
+	}
+
 	r.applyConditions(br, conditionInputs{
 		reachable: condFromBool(p.Reachable, p.ReachableReason, p.ReachableMessage),
 		bucketSecurityValid: ifReachable(p.Reachable,
 			condFromBool(p.BucketSecurityValid, p.BucketSecurityReason, p.BucketSecurityMessage)),
-		backupCurrent: ifReachable(p.Reachable, computeBackupCurrent(br, now.Time)),
-		metadataValid: metadataValid,
-		e2JobActive:   e2.jobActive,
+		backupCurrent:         ifReachable(p.Reachable, computeBackupCurrent(br, now.Time)),
+		metadataValid:         metadataValid,
+		e2JobActive:           e2.jobActive,
+		sampledIntegrityValid: sampledIntegrityValid,
+		e3JobActive:           e3.jobActive,
 	})
 
 	return r.Status().Patch(ctx, br, patch)
@@ -328,6 +421,11 @@ type conditionInputs struct {
 	// pick the right Unknown reason for MetadataValid in the no-result
 	// case (job is in flight vs. genuinely not yet available).
 	e2JobActive bool
+	// sampledIntegrityValid: same shape as metadataValid but for E3.
+	// nil means no completed E3 has been ingested yet — combined with
+	// "is E3 enabled at all" decides whether to emit the condition.
+	sampledIntegrityValid *metav1.Condition
+	e3JobActive           bool
 }
 
 // applyConditions writes the full condition set onto br.Status.Conditions:
@@ -382,10 +480,22 @@ func (r *BackupRepositoryReconciler) applyConditions(
 			"no E2 validation has completed yet"))
 	}
 
+	// SampledIntegrityValid (E3): present only if E3 enabled. Preserve
+	// latest result if available; otherwise distinguish "Job in flight"
+	// from "no E3 has run yet."
 	if br.Spec.SampledRetrievalInterval != nil {
-		setCondition(cs, aretev1alpha1.ConditionSampledIntegrityValid, condUnknown(
-			aretev1alpha1.ReasonLayerTwoNotYetAvailable,
-			"E3 sampled retrieval Job not yet implemented (Pass 3c)"))
+		switch {
+		case in.sampledIntegrityValid != nil:
+			setCondition(cs, aretev1alpha1.ConditionSampledIntegrityValid, in.sampledIntegrityValid)
+		case in.e3JobActive:
+			setCondition(cs, aretev1alpha1.ConditionSampledIntegrityValid, condUnknown(
+				aretev1alpha1.ReasonLayerTwoNotYetAvailable,
+				"E3 sampled retrieval Job in flight; result will land on next reconcile"))
+		default:
+			setCondition(cs, aretev1alpha1.ConditionSampledIntegrityValid, condUnknown(
+				aretev1alpha1.ReasonLayerTwoNotYetAvailable,
+				"no E3 sampled retrieval has completed yet"))
+		}
 	} else {
 		removeCondition(cs, aretev1alpha1.ConditionSampledIntegrityValid)
 	}
