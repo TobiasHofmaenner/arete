@@ -67,6 +67,7 @@ type BackupRepositoryReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 
 func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -91,7 +92,10 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// E3 Job lifecycle: opt-in via spec.sampledRetrievalInterval
 	e3 := r.processE3(ctx, &br, creds)
 
-	if err := r.applyStatus(ctx, &br, probe, e2, e3); err != nil {
+	// E4 Job lifecycle: opt-in via spec.fullRetrievalInterval
+	e4 := r.processE4(ctx, &br)
+
+	if err := r.applyStatus(ctx, &br, probe, e2, e3, e4); err != nil {
 		log.Error(err, "failed to update status")
 		return ctrl.Result{}, err
 	}
@@ -117,6 +121,16 @@ type e3Outcome struct {
 	jobActive       bool
 	completedResult *metav1.Condition
 	completedAt     *time.Time
+}
+
+// e4Outcome mirrors e3Outcome for the full retrieval level. The
+// timestamp lives in status.lastFullRetrieval.completedAt — there's no
+// separate verifiedLastFullRetrievalAt because LastFullRetrieval is
+// itself a richer struct that covers the same role.
+type e4Outcome struct {
+	jobActive       bool
+	completedResult *metav1.Condition
+	stats           *aretev1alpha1.FullRetrievalStatus
 }
 
 // processE2 inspects existing E2 Jobs for this BR, ingests results from
@@ -226,6 +240,81 @@ func (r *BackupRepositoryReconciler) ingestE3Result(
 	)
 }
 
+// processE4 mirrors processE3 for full retrieval. Skipped entirely when
+// fullRetrievalInterval is nil. Uses LastFullRetrieval.CompletedAt as
+// both the "we already ingested this Job" marker and the "due for
+// another run" anchor — no separate VerifiedLastFullRetrievalAt field.
+func (r *BackupRepositoryReconciler) processE4(
+	ctx context.Context, br *aretev1alpha1.BackupRepository,
+) e4Outcome {
+	log := logf.FromContext(ctx)
+	out := e4Outcome{}
+	if br.Spec.FullRetrievalInterval == nil {
+		return out
+	}
+
+	jobs, err := r.listE4Jobs(ctx, br)
+	if err != nil {
+		log.Error(err, "list e4 jobs")
+		return out
+	}
+
+	if active := firstActiveJob(jobs); active != nil {
+		out.jobActive = true
+	}
+
+	if latest := pickLatestCompletedJob(jobs); latest != nil {
+		completedAt := jobCompletionTime(latest)
+		alreadyIngested := br.Status.LastFullRetrieval != nil &&
+			!completedAt.After(br.Status.LastFullRetrieval.CompletedAt.Time)
+		if !alreadyIngested {
+			cond, stats := r.ingestE4Result(ctx, latest)
+			out.completedResult = cond
+			if stats != nil {
+				stats.CompletedAt = metav1.NewTime(completedAt)
+			}
+			out.stats = stats
+		}
+	}
+
+	var lastE4 *metav1.Time
+	if br.Status.LastFullRetrieval != nil {
+		lastE4 = &br.Status.LastFullRetrieval.CompletedAt
+	}
+	if !out.jobActive && shouldSpawnE4(br, lastE4, time.Now()) {
+		if _, err := r.spawnE4Job(ctx, br); err != nil {
+			log.Error(err, "spawn e4 job")
+		} else {
+			out.jobActive = true
+			log.Info("spawned E4 job", "format", br.Spec.Format)
+		}
+	}
+
+	return out
+}
+
+// ingestE4Result turns a finished E4 Job into a (FullRetrievalCompleted
+// condition, FullRetrievalStatus) pair. The condition reflects exit
+// code; the stats come from the validator's STATS line. On failure we
+// still try to parse stats — partial timing tells the user how far the
+// retrieval got before bailing.
+func (r *BackupRepositoryReconciler) ingestE4Result(
+	ctx context.Context, job *batchv1.Job,
+) (*metav1.Condition, *aretev1alpha1.FullRetrievalStatus) {
+	logs := r.readJobOutput(ctx, job)
+	stats := parseE4Stats(logs)
+	if !jobSucceeded(job) {
+		return condFalse(
+			aretev1alpha1.ReasonFullRetrievalFailed,
+			fmt.Sprintf("full retrieval failed; last log: %s", lastLine(logs)),
+		), stats
+	}
+	return condTrue(
+		aretev1alpha1.ReasonProbeSucceeded,
+		fmt.Sprintf("full retrieval ok; last log: %s", lastLine(logs)),
+	), stats
+}
+
 // ingestE2Result turns a finished Job into a (MetadataValid condition,
 // claimedLatestBackup struct). The condition reflects exit code; the
 // LatestBackup is parsed from the validator's JSON output if present.
@@ -331,10 +420,11 @@ func (r *BackupRepositoryReconciler) recordCredentialsFailure(
 }
 
 // applyStatus computes every condition and updates the structured status
-// fields from the probe + e2 + e3 outcomes, then patches the BackupRepository.
+// fields from the probe + e2 + e3 + e4 outcomes, then patches the
+// BackupRepository.
 func (r *BackupRepositoryReconciler) applyStatus(
 	ctx context.Context, br *aretev1alpha1.BackupRepository,
-	p probeResult, e2 e2Outcome, e3 e3Outcome,
+	p probeResult, e2 e2Outcome, e3 e3Outcome, e4 e4Outcome,
 ) error {
 	patch := client.MergeFrom(br.DeepCopy())
 	now := metav1.Now()
@@ -392,15 +482,33 @@ func (r *BackupRepositoryReconciler) applyStatus(
 		}
 	}
 
+	// Ingest E4 result. LastFullRetrieval is the timing source-of-truth.
+	var fullRetrievalCompleted *metav1.Condition
+	if e4.completedResult != nil {
+		fullRetrievalCompleted = e4.completedResult
+		if e4.stats != nil {
+			br.Status.LastFullRetrieval = e4.stats
+		}
+	} else if br.Status.LastFullRetrieval != nil {
+		if existing := apimeta.FindStatusCondition(br.Status.Conditions,
+			aretev1alpha1.ConditionFullRetrievalCompleted); existing != nil &&
+			existing.Reason != aretev1alpha1.ReasonLayerTwoNotYetAvailable {
+			c := *existing
+			fullRetrievalCompleted = &c
+		}
+	}
+
 	r.applyConditions(br, conditionInputs{
 		reachable: condFromBool(p.Reachable, p.ReachableReason, p.ReachableMessage),
 		bucketSecurityValid: ifReachable(p.Reachable,
 			condFromBool(p.BucketSecurityValid, p.BucketSecurityReason, p.BucketSecurityMessage)),
-		backupCurrent:         ifReachable(p.Reachable, computeBackupCurrent(br, now.Time)),
-		metadataValid:         metadataValid,
-		e2JobActive:           e2.jobActive,
-		sampledIntegrityValid: sampledIntegrityValid,
-		e3JobActive:           e3.jobActive,
+		backupCurrent:          ifReachable(p.Reachable, computeBackupCurrent(br, now.Time)),
+		metadataValid:          metadataValid,
+		e2JobActive:            e2.jobActive,
+		sampledIntegrityValid:  sampledIntegrityValid,
+		e3JobActive:            e3.jobActive,
+		fullRetrievalCompleted: fullRetrievalCompleted,
+		e4JobActive:            e4.jobActive,
 	})
 
 	return r.Status().Patch(ctx, br, patch)
@@ -426,6 +534,9 @@ type conditionInputs struct {
 	// "is E3 enabled at all" decides whether to emit the condition.
 	sampledIntegrityValid *metav1.Condition
 	e3JobActive           bool
+	// fullRetrievalCompleted: same shape, for E4.
+	fullRetrievalCompleted *metav1.Condition
+	e4JobActive            bool
 }
 
 // applyConditions writes the full condition set onto br.Status.Conditions:
@@ -499,10 +610,22 @@ func (r *BackupRepositoryReconciler) applyConditions(
 	} else {
 		removeCondition(cs, aretev1alpha1.ConditionSampledIntegrityValid)
 	}
+	// FullRetrievalCompleted (E4): present only if E4 enabled. Same
+	// state machine as E3: latest result wins; otherwise distinguish
+	// in-flight from never-run.
 	if br.Spec.FullRetrievalInterval != nil {
-		setCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted, condUnknown(
-			aretev1alpha1.ReasonLayerTwoNotYetAvailable,
-			"E4 full retrieval Job not yet implemented (Pass 3c)"))
+		switch {
+		case in.fullRetrievalCompleted != nil:
+			setCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted, in.fullRetrievalCompleted)
+		case in.e4JobActive:
+			setCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted, condUnknown(
+				aretev1alpha1.ReasonLayerTwoNotYetAvailable,
+				"E4 full retrieval Job in flight; result will land on next reconcile"))
+		default:
+			setCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted, condUnknown(
+				aretev1alpha1.ReasonLayerTwoNotYetAvailable,
+				"no E4 full retrieval has completed yet"))
+		}
 	} else {
 		removeCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted)
 	}
