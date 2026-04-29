@@ -162,7 +162,13 @@ func (r *BackupRepositoryReconciler) e3CommandArgsEnv(
 		// Diagnostic prelude: echo WALG_* env so the pod log shows what
 		// wal-g actually inherits (caught a controller-vs-kubectl env
 		// mystery on 2026-04-29).
-		script := "echo === wal-g env ===; env | grep -E '^(WALG|AWS)_' | sed 's/_KEY=.*$/_KEY=<redacted>/;s/SECRET_ACCESS_KEY=.*$/SECRET_ACCESS_KEY=<redacted>/'; echo ===; " +
+		script := "echo === wal-g env ===; " +
+			"echo 'WALG_S3_PREFIX=['$WALG_S3_PREFIX']'; " +
+			"echo 'AWS_REGION=['$AWS_REGION']'; " +
+			"echo 'AWS_ENDPOINT=['$AWS_ENDPOINT']'; " +
+			"echo 'AWS_S3_FORCE_PATH_STYLE=['$AWS_S3_FORCE_PATH_STYLE']'; " +
+			"echo 'WALG_COMPRESSION_METHOD=['$WALG_COMPRESSION_METHOD']'; " +
+			"echo ===; " +
 			"for s in " + strings.Join(samples, " ") + "; do " +
 			"  echo fetching $s; " +
 			"  if ! wal-g wal-fetch \"$s\" /tmp/seg; then " +
