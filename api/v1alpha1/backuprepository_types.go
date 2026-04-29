@@ -93,7 +93,11 @@ type S3Source struct {
 	RequireBucketEncryption bool `json:"requireBucketEncryption,omitempty"`
 }
 
-// SecretReference is a namespaced reference to a Secret.
+// SecretReference is a namespaced reference to a Secret, with optional
+// key remapping for Secrets whose key names don't match arete's canonical
+// AWS_* / RESTIC_PASSWORD / WALG_LIBSODIUM_KEY conventions. Lets a tenant
+// point arete at the producer's existing Secret (e.g. cnpg-plugin-wal-g's
+// nextcloud-s3 with ACCESS_KEY_ID / ACCESS_SECRET_KEY) without copying.
 type SecretReference struct {
 	// +kubebuilder:validation:MinLength=1
 	// +required
@@ -102,6 +106,22 @@ type SecretReference struct {
 	// +kubebuilder:validation:MinLength=1
 	// +required
 	Namespace string `json:"namespace"`
+
+	// keyMapping renames Secret data keys for arete's use. The MAP KEY is
+	// the canonical name arete (and the validator binary) expects;
+	// the MAP VALUE is the actual key in the Secret.
+	//
+	// Example — nextcloud-s3 has ACCESS_KEY_ID/ACCESS_SECRET_KEY:
+	//   keyMapping:
+	//     AWS_ACCESS_KEY_ID: ACCESS_KEY_ID
+	//     AWS_SECRET_ACCESS_KEY: ACCESS_SECRET_KEY
+	//
+	// Canonical names not present in keyMapping use identity (key must
+	// be the canonical name in the Secret). Unknown canonical names are
+	// silently passed through with optional=true on the Job env var, so
+	// missing optional creds (e.g. AWS_SESSION_TOKEN) don't fail the Job.
+	// +optional
+	KeyMapping map[string]string `json:"keyMapping,omitempty"`
 }
 
 // ----- spec -----

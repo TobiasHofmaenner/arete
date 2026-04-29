@@ -218,6 +218,24 @@ spec:
                       credentialsSecret references a Secret containing AWS_ACCESS_KEY_ID
                       and AWS_SECRET_ACCESS_KEY keys. Cluster-scoped CR requires namespace.
                     properties:
+                      keyMapping:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          keyMapping renames Secret data keys for arete's use. The MAP KEY is
+                          the canonical name arete (and the validator binary) expects;
+                          the MAP VALUE is the actual key in the Secret.
+
+                          Example — nextcloud-s3 has ACCESS_KEY_ID/ACCESS_SECRET_KEY:
+                            keyMapping:
+                              AWS_ACCESS_KEY_ID: ACCESS_KEY_ID
+                              AWS_SECRET_ACCESS_KEY: ACCESS_SECRET_KEY
+
+                          Canonical names not present in keyMapping use identity (key must
+                          be the canonical name in the Secret). Unknown canonical names are
+                          silently passed through with optional=true on the Job env var, so
+                          missing optional creds (e.g. AWS_SESSION_TOKEN) don't fail the Job.
+                        type: object
                       name:
                         minLength: 1
                         type: string

@@ -206,19 +206,30 @@ func (r *BackupRepositoryReconciler) resolveCredentials(
 		return S3Credentials{}, fmt.Errorf("get secret %s: %w", key, err)
 	}
 
-	access := string(secret.Data["AWS_ACCESS_KEY_ID"])
-	secretKey := string(secret.Data["AWS_SECRET_ACCESS_KEY"])
+	mapping := br.Spec.S3.CredentialsSecret.KeyMapping
+	access := string(secret.Data[secretKeyFor("AWS_ACCESS_KEY_ID", mapping)])
+	secretKey := string(secret.Data[secretKeyFor("AWS_SECRET_ACCESS_KEY", mapping)])
 	if access == "" || secretKey == "" {
 		return S3Credentials{}, fmt.Errorf(
-			"secret %s missing required keys AWS_ACCESS_KEY_ID and/or AWS_SECRET_ACCESS_KEY",
+			"secret %s missing data for AWS_ACCESS_KEY_ID and/or AWS_SECRET_ACCESS_KEY (after keyMapping)",
 			key,
 		)
 	}
 	return S3Credentials{
 		AccessKeyID:     access,
 		SecretAccessKey: secretKey,
-		SessionToken:    string(secret.Data["AWS_SESSION_TOKEN"]),
+		SessionToken:    string(secret.Data[secretKeyFor("AWS_SESSION_TOKEN", mapping)]),
 	}, nil
+}
+
+// secretKeyFor resolves a canonical env-var name to the actual key in
+// the user's Secret. Returns the canonical name itself if no override
+// is provided (identity mapping).
+func secretKeyFor(canonical string, mapping map[string]string) string {
+	if remapped, ok := mapping[canonical]; ok && remapped != "" {
+		return remapped
+	}
+	return canonical
 }
 
 // recordCredentialsFailure handles the pre-probe failure case (no creds, so

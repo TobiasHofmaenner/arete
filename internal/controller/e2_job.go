@@ -183,14 +183,10 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 						Command:         cmd,
 						Args:            args,
 						SecurityContext: restrictedContainerSecurityContext(),
-						EnvFrom: []corev1.EnvFromSource{{
-							SecretRef: &corev1.SecretEnvSource{
-								LocalObjectReference: corev1.LocalObjectReference{
-									Name: br.Spec.S3.CredentialsSecret.Name,
-								},
-							},
-						}},
-						Env: e2EnvFor(br.Spec),
+						Env: append(
+							credentialEnvVars(br.Spec),
+							e2EnvFor(br.Spec)...,
+						),
 					}},
 				},
 			},
@@ -334,6 +330,54 @@ func e2CommandFor(format aretev1alpha1.BackupFormat) []string {
 				"restic check && restic snapshots --json"}
 	}
 	return nil
+}
+
+// credentialEnvVars returns the env vars the validator needs from the
+// credentialsSecret. Each entry uses valueFrom.secretKeyRef so the
+// validator receives the canonical name (AWS_ACCESS_KEY_ID etc.) even
+// if the source Secret stores the value under a different key (per
+// spec.s3.credentialsSecret.keyMapping).
+//
+// Optional flags (AWS_SESSION_TOKEN, etc.) are marked optional=true so
+// the Job doesn't fail to start when they're absent. Required vars
+// (AWS_*, RESTIC_PASSWORD for restic) are NOT optional — the binary
+// will fail loudly if they're missing, which is what we want under the
+// strict contract.
+func credentialEnvVars(spec aretev1alpha1.BackupRepositorySpec) []corev1.EnvVar {
+	mapping := spec.S3.CredentialsSecret.KeyMapping
+	secretName := spec.S3.CredentialsSecret.Name
+	out := []corev1.EnvVar{
+		credEnv("AWS_ACCESS_KEY_ID", secretName, mapping, false),
+		credEnv("AWS_SECRET_ACCESS_KEY", secretName, mapping, false),
+		credEnv("AWS_SESSION_TOKEN", secretName, mapping, true),
+	}
+	switch spec.Format {
+	case aretev1alpha1.BackupFormatWalg:
+		// Required for E3/E4 against encrypted repos. Optional at E2:
+		// `wal-g backup-list` reads plaintext sentinels and works
+		// without it.
+		out = append(out, credEnv("WALG_LIBSODIUM_KEY", secretName, mapping, true))
+	case aretev1alpha1.BackupFormatRestic:
+		// Required for any restic operation against an encrypted repo
+		// (which all restic repos are).
+		out = append(out, credEnv("RESTIC_PASSWORD", secretName, mapping, false))
+	}
+	return out
+}
+
+// credEnv builds a single env var sourced from a Secret key, applying
+// the keyMapping override if present.
+func credEnv(canonical, secretName string, mapping map[string]string, optional bool) corev1.EnvVar {
+	return corev1.EnvVar{
+		Name: canonical,
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Key:                  secretKeyFor(canonical, mapping),
+				Optional:             ptrBool(optional),
+			},
+		},
+	}
 }
 
 // e2EnvFor returns the per-spec env vars (paths + region + endpoint) the
