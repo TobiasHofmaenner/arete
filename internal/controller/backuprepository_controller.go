@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
+	aretemetrics "github.com/TobiasHofmaenner/arete/internal/metrics"
 )
 
 // ValidatorImages holds the per-format validator container image
@@ -100,7 +101,58 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
+	publishMetrics(&br)
+
 	return ctrl.Result{RequeueAfter: br.Spec.ProbeInterval.Duration}, nil
+}
+
+// publishMetrics snapshots the BackupRepository's status into the
+// per-BR Prometheus gauges. Called every reconcile so freshness alerts
+// (BackupAgeSeconds, ConditionState) reflect current state. Counters
+// and histograms are bumped separately on ingest (recordValidationRun).
+func publishMetrics(br *aretev1alpha1.BackupRepository) {
+	format := string(br.Spec.Format)
+
+	if br.Status.ClaimedLastSuccessfulBackup != nil {
+		age := time.Since(br.Status.ClaimedLastSuccessfulBackup.Time).Seconds()
+		aretemetrics.BackupAgeSeconds.WithLabelValues(br.Name, format).Set(age)
+	}
+
+	if e4 := br.Status.LastFullRetrieval; e4 != nil {
+		aretemetrics.E4ThroughputBPS.WithLabelValues(br.Name, format).Set(float64(e4.ThroughputBytesPerSec))
+		aretemetrics.E4BytesTransferred.WithLabelValues(br.Name, format).Set(float64(e4.BytesTransferred))
+	}
+
+	for _, c := range br.Status.Conditions {
+		var v float64
+		switch c.Status {
+		case metav1.ConditionTrue:
+			v = 1
+		case metav1.ConditionFalse:
+			v = 0
+		case metav1.ConditionUnknown:
+			v = -1
+		}
+		aretemetrics.ConditionState.WithLabelValues(br.Name, format, c.Type).Set(v)
+	}
+}
+
+// recordValidationRun bumps the run counter + duration histogram for a
+// finished E2/E3/E4 Job. Called from each ingestE*Result.
+func recordValidationRun(br *aretev1alpha1.BackupRepository, level string, job *batchv1.Job) {
+	format := string(br.Spec.Format)
+	result := "success"
+	if !jobSucceeded(job) {
+		result = "failure"
+	}
+	aretemetrics.ValidationRunsTotal.WithLabelValues(br.Name, format, level, result).Inc()
+
+	if job.Status.StartTime != nil {
+		duration := jobCompletionTime(job).Sub(job.Status.StartTime.Time).Seconds()
+		if duration > 0 {
+			aretemetrics.ValidationDurationSeconds.WithLabelValues(br.Name, format, level).Observe(duration)
+		}
+	}
 }
 
 // e2Outcome captures what we learned about E2 this reconcile cycle:
@@ -161,6 +213,7 @@ func (r *BackupRepositoryReconciler) processE2(
 			out.completedResult = cond
 			out.completedAt = &completedAt
 			out.latestBackup = latestBackup
+			recordValidationRun(br, "e2", latest)
 		}
 	}
 
@@ -207,6 +260,7 @@ func (r *BackupRepositoryReconciler) processE3(
 		if !alreadyIngested {
 			out.completedResult = r.ingestE3Result(ctx, latest)
 			out.completedAt = &completedAt
+			recordValidationRun(br, "e3", latest)
 		}
 	}
 
@@ -274,6 +328,7 @@ func (r *BackupRepositoryReconciler) processE4(
 				stats.CompletedAt = metav1.NewTime(completedAt)
 			}
 			out.stats = stats
+			recordValidationRun(br, "e4", latest)
 		}
 	}
 

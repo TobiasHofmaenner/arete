@@ -69,6 +69,14 @@ metrics:
 # [PROMETHEUS]: To enable a ServiceMonitor to export metrics to Prometheus set true
 prometheus:
   enable: false
+  # rules: install the bundled PrometheusRule with arete-specific alerts.
+  # Independent of the ServiceMonitor — you can scrape via your own
+  # ServiceMonitor while still consuming the canned alerts.
+  rules:
+    enable: false
+    # additionalLabels lets the rules satisfy your Prometheus operator's
+    # ruleSelector. kube-prometheus-stack defaults to release=<name>.
+    additionalLabels: {}
 
 # [CERT-MANAGER]: To enable cert-manager injection to webhooks set true
 certmanager:

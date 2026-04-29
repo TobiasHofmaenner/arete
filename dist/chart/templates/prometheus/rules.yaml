@@ -1,0 +1,145 @@
+{{- if and .Values.prometheus.enable .Values.prometheus.rules.enable }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: arete-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+    {{- with .Values.prometheus.rules.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+  - name: arete.health
+    interval: 1m
+    rules:
+    # The most direct alert: any BR's overall Health rolled up to False.
+    # 1h gives one E1 cycle (probeInterval defaults to 10m) several
+    # chances to clear before paging.
+    - alert: AreteBackupRepositoryUnhealthy
+      expr: arete_condition_state{condition="Healthy"} == 0
+      for: 1h
+      labels:
+        severity: critical
+      annotations:
+        summary: "BackupRepository {{`{{ $labels.br }}`}} is unhealthy"
+        description: |
+          BR {{`{{ $labels.br }}`}} (format {{`{{ $labels.format }}`}}) has Health=False
+          for over 1h. Inspect: kubectl describe br {{`{{ $labels.br }}`}}
+
+    # E1 reachability. False here means we can't even talk to S3.
+    - alert: AreteRepositoryUnreachable
+      expr: arete_condition_state{condition="Reachable"} == 0
+      for: 30m
+      labels:
+        severity: critical
+      annotations:
+        summary: "BackupRepository {{`{{ $labels.br }}`}} unreachable"
+        description: |
+          BR {{`{{ $labels.br }}`}} can't reach its S3 endpoint. Likely
+          a credential, network, or bucket-policy regression. Check:
+          kubectl describe br {{`{{ $labels.br }}`}}
+
+    # Backup freshness — derived from spec.maxBackupLag (the BR's own
+    # contract). False here means the most recent backup violates its
+    # own staleness budget.
+    - alert: AreteBackupStale
+      expr: arete_condition_state{condition="BackupCurrent"} == 0
+      for: 1h
+      labels:
+        severity: critical
+      annotations:
+        summary: "BackupRepository {{`{{ $labels.br }}`}} backup is stale"
+        description: |
+          BR {{`{{ $labels.br }}`}} has no recent successful backup
+          within its maxBackupLag. The producer (cnpg / VolSync /
+          equivalent) likely stopped writing. arete only observes;
+          fix the producer.
+
+    # E2 metadata validation failure — sentinel parsing or backup-list
+    # broke. Often a producer/consumer version skew.
+    - alert: AreteMetadataValidationFailing
+      expr: arete_condition_state{condition="MetadataValid"} == 0
+      for: 30m
+      labels:
+        severity: warning
+      annotations:
+        summary: "BackupRepository {{`{{ $labels.br }}`}} E2 (metadata) failing"
+        description: |
+          arete's metadata validator is failing on
+          {{`{{ $labels.br }}`}}. Likely producer/consumer drift —
+          check the latest E2 Job's logs. Restoration may still work,
+          but the backup metadata can't be parsed reliably.
+
+    # E3 sample retrieval failure — random samples can't be decrypted
+    # or fetched. This is the strongest signal short of a real DR
+    # that backups aren't restorable.
+    - alert: AreteSampledRetrievalFailing
+      expr: arete_condition_state{condition="SampledIntegrityValid"} == 0
+      for: 30m
+      labels:
+        severity: critical
+      annotations:
+        summary: "BackupRepository {{`{{ $labels.br }}`}} E3 (sampled retrieval) failing"
+        description: |
+          arete can't read random samples from
+          {{`{{ $labels.br }}`}}. This is the canary for unrestorable
+          backups. Treat as a DR-grade incident: check encryption
+          keys, S3 read permissions, and the latest E3 Job's logs.
+
+    # E4 full retrieval failure — full restore-grade read broke. Even
+    # more direct than E3.
+    - alert: AreteFullRetrievalFailing
+      expr: arete_condition_state{condition="FullRetrievalCompleted"} == 0
+      for: 30m
+      labels:
+        severity: critical
+      annotations:
+        summary: "BackupRepository {{`{{ $labels.br }}`}} E4 (full retrieval) failing"
+        description: |
+          arete's full-retrieval validator is failing on
+          {{`{{ $labels.br }}`}}. Inspect the latest E4 Job and the
+          PVC arete-e4-{{`{{ $labels.br }}`}}.
+
+  - name: arete.freshness
+    interval: 1m
+    rules:
+    # If E2 hasn't run successfully in a day, validation has stopped.
+    # The default cadence is 6h, so 1d = 4 missed cycles → real
+    # problem (controller stuck, persistent Job failures, RBAC, etc).
+    - alert: AreteValidationStopped
+      expr: |
+        rate(arete_validation_runs_total{level="e2",result="success"}[1d]) == 0
+        and on(br) arete_condition_state{condition="MetadataValid"}
+      for: 1h
+      labels:
+        severity: warning
+      annotations:
+        summary: "BackupRepository {{`{{ $labels.br }}`}} hasn't completed E2 in 24h"
+        description: |
+          arete hasn't recorded a successful E2 run for
+          {{`{{ $labels.br }}`}} in the last 24 hours. Either the
+          controller is wedged or every E2 Job is failing.
+
+    # E4 throughput regression — paged early so you can investigate
+    # before the next real DR. 30% drop vs 30d median trips it.
+    - alert: AreteE4ThroughputRegressed
+      expr: |
+        (
+          arete_e4_throughput_bytes_per_sec
+          /
+          quantile_over_time(0.5, arete_e4_throughput_bytes_per_sec[30d])
+        ) < 0.7
+        and arete_e4_throughput_bytes_per_sec > 0
+      for: 1h
+      labels:
+        severity: warning
+      annotations:
+        summary: "BackupRepository {{`{{ $labels.br }}`}} E4 throughput regressed >30%"
+        description: |
+          The most recent E4 run for {{`{{ $labels.br }}`}} restored
+          at {{`{{ $value | humanize }}x`}} the 30-day median.
+          Network or storage backend may be degraded; this directly
+          affects RTO.
+{{- end }}
