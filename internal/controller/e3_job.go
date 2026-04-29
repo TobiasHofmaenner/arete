@@ -162,7 +162,8 @@ func (r *BackupRepositoryReconciler) e3CommandArgsEnv(
 		// Diagnostic prelude: echo WALG_* env so the pod log shows what
 		// wal-g actually inherits (caught a controller-vs-kubectl env
 		// mystery on 2026-04-29).
-		script := "echo === wal-g env ===; " +
+		script := "echo === sleeping 300s for exec debug ===; sleep 300; " +
+			"echo === wal-g env ===; " +
 			"echo 'WALG_S3_PREFIX=['$WALG_S3_PREFIX']'; " +
 			"echo 'AWS_REGION=['$AWS_REGION']'; " +
 			"echo 'AWS_ENDPOINT=['$AWS_ENDPOINT']'; " +
