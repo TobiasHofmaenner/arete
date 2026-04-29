@@ -123,6 +123,13 @@ func publishMetrics(br *aretev1alpha1.BackupRepository) {
 		aretemetrics.E4BytesTransferred.WithLabelValues(br.Name, format).Set(float64(e4.BytesTransferred))
 	}
 
+	if inv := br.Status.ObservedInventory; inv != nil {
+		aretemetrics.InventoryObjects.WithLabelValues(br.Name, format).Set(float64(inv.ObjectCount))
+		if v, ok := inv.TotalBytes.AsInt64(); ok {
+			aretemetrics.InventoryBytes.WithLabelValues(br.Name, format).Set(float64(v))
+		}
+	}
+
 	for _, c := range br.Status.Conditions {
 		var v float64
 		switch c.Status {
@@ -499,6 +506,9 @@ func (r *BackupRepositoryReconciler) applyStatus(
 	if p.LatestBackup != nil {
 		br.Status.ClaimedLatestBackup = p.LatestBackup
 	}
+	if p.Inventory != nil {
+		br.Status.ObservedInventory = p.Inventory
+	}
 
 	// Ingest any newly-completed E2 result into status.
 	var metadataValid *metav1.Condition
@@ -621,11 +631,11 @@ func (r *BackupRepositoryReconciler) applyConditions(
 			condUnknown(aretev1alpha1.ReasonProbeSucceeded, "not yet evaluated this cycle"))
 	}
 
-	// SizeWithinBudget — only if budget is set; Unknown until inventory ships
+	// SizeWithinBudget — only if budget is set. Compares
+	// observedInventory.totalBytes against spec.expectedSizeBudget.
 	if br.Spec.ExpectedSizeBudget != nil {
-		setCondition(cs, aretev1alpha1.ConditionSizeWithinBudget, condUnknown(
-			aretev1alpha1.ReasonLayerTwoNotYetAvailable,
-			"observedInventory not yet implemented (Pass 3-inventory)"))
+		setCondition(cs, aretev1alpha1.ConditionSizeWithinBudget,
+			computeSizeWithinBudget(br))
 	} else {
 		removeCondition(cs, aretev1alpha1.ConditionSizeWithinBudget)
 	}
@@ -706,6 +716,31 @@ func (r *BackupRepositoryReconciler) applyConditions(
 		aretev1alpha1.ConditionValidationHealthy,
 	)
 	setCondition(cs, aretev1alpha1.ConditionHealthy, &overall)
+}
+
+// computeSizeWithinBudget returns SizeWithinBudget True/False/Unknown:
+//   - Unknown if observedInventory hasn't been recorded yet.
+//   - True  if inventory.totalBytes <= spec.expectedSizeBudget.
+//   - False (SizeBudgetExceeded) when over.
+func computeSizeWithinBudget(br *aretev1alpha1.BackupRepository) *metav1.Condition {
+	if br.Status.ObservedInventory == nil {
+		return condUnknown(
+			aretev1alpha1.ReasonLayerTwoNotYetAvailable,
+			"observedInventory not yet recorded; first inventory probe pending",
+		)
+	}
+	have := br.Status.ObservedInventory.TotalBytes
+	budget := *br.Spec.ExpectedSizeBudget
+	if have.Cmp(budget) <= 0 {
+		return condTrue(
+			aretev1alpha1.ReasonProbeSucceeded,
+			fmt.Sprintf("inventory %s within budget %s", have.String(), budget.String()),
+		)
+	}
+	return condFalse(
+		aretev1alpha1.ReasonSizeBudgetExceeded,
+		fmt.Sprintf("inventory %s exceeds budget %s", have.String(), budget.String()),
+	)
 }
 
 // computeBackupCurrent applies the lag check: True iff

@@ -83,6 +83,25 @@ var (
 		[]string{"br", "format"},
 	)
 
+	// InventoryObjects mirrors observedInventory.objectCount.
+	InventoryObjects = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "arete_inventory_objects",
+			Help: "Total objects under the BackupRepository's S3 prefix.",
+		},
+		[]string{"br", "format"},
+	)
+
+	// InventoryBytes mirrors observedInventory.totalBytes. Trending this
+	// catches runaway growth before it blows the cost budget.
+	InventoryBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "arete_inventory_bytes",
+			Help: "Total bytes across all objects under the BackupRepository's S3 prefix.",
+		},
+		[]string{"br", "format"},
+	)
+
 	// ConditionState encodes each BackupRepository condition as a number:
 	//   1  = True (healthy / passing)
 	//   0  = False (broken — alert on this)
@@ -105,6 +124,8 @@ func init() {
 		E4ThroughputBPS,
 		E4BytesTransferred,
 		BackupAgeSeconds,
+		InventoryObjects,
+		InventoryBytes,
 		ConditionState,
 	)
 }

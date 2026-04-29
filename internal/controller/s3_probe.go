@@ -77,6 +77,11 @@ type probeResult struct {
 	DetectedVersion      string
 	LastSuccessfulBackup *metav1.Time
 	LatestBackup         *aretev1alpha1.LatestBackupStatus // wal-g only at E1; nil for restic
+
+	// Inventory is the result of the recursive LIST run alongside the
+	// E1 reachability check. nil if reachability failed (no point
+	// scanning a prefix we couldn't reach).
+	Inventory *aretev1alpha1.InventoryStatus
 }
 
 // probeRepository runs one E1 cycle. Pure function over (spec, creds) — no
@@ -122,7 +127,61 @@ func probeRepository(
 	result.LastSuccessfulBackup = lastSuccess
 	result.LatestBackup = latest
 
+	// Phase 4: inventory. Best-effort; if it fails we leave the field
+	// nil and the controller preserves the previous status.
+	if inv, err := runInventoryProbe(ctx, client, spec); err == nil {
+		result.Inventory = inv
+	}
+
 	return result
+}
+
+// runInventoryProbe walks the full prefix recursively to compute object
+// count, total bytes, and oldest/newest LastModified. Bounded by a
+// generous timeout — for repos with millions of objects this would need
+// to be paginated/sharded, but our largest current repos are <50k.
+func runInventoryProbe(
+	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
+) (*aretev1alpha1.InventoryStatus, error) {
+	listCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	var (
+		count   int64
+		bytes   int64
+		oldest  time.Time
+		newest  time.Time
+		hasTime bool
+	)
+	for obj := range client.ListObjects(listCtx, spec.S3.Bucket, minio.ListObjectsOptions{
+		Prefix:    spec.S3.Prefix + "/",
+		Recursive: true,
+	}) {
+		if obj.Err != nil {
+			return nil, obj.Err
+		}
+		count++
+		bytes += obj.Size
+		if !hasTime || obj.LastModified.Before(oldest) {
+			oldest = obj.LastModified
+		}
+		if !hasTime || obj.LastModified.After(newest) {
+			newest = obj.LastModified
+		}
+		hasTime = true
+	}
+
+	out := &aretev1alpha1.InventoryStatus{
+		ObjectCount: count,
+		TotalBytes:  *resource.NewQuantity(bytes, resource.BinarySI),
+	}
+	if hasTime {
+		o := metav1.NewTime(oldest)
+		n := metav1.NewTime(newest)
+		out.OldestObject = &o
+		out.NewestObject = &n
+	}
+	return out, nil
 }
 
 func buildS3Client(src aretev1alpha1.S3Source, creds S3Credentials) (*minio.Client, error) {
