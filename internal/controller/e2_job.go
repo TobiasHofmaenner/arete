@@ -422,21 +422,21 @@ func credEnv(canonical, secretName string, mapping map[string]string, optional b
 // WALG_COMPRESSION_METHOD that the producer sets and the validator
 // must mirror).
 func e2EnvFor(spec aretev1alpha1.BackupRepositorySpec) []corev1.EnvVar {
-	var base []corev1.EnvVar
+	base := make([]corev1.EnvVar, 0, 4+len(spec.S3.ExtraEnv))
 	switch spec.Format {
 	case aretev1alpha1.BackupFormatWalg:
-		base = []corev1.EnvVar{
-			{Name: "WALG_S3_PREFIX", Value: fmt.Sprintf("s3://%s/%s", spec.S3.Bucket, spec.S3.Prefix)},
-			{Name: "AWS_REGION", Value: spec.S3.Region},
-			{Name: "AWS_ENDPOINT", Value: spec.S3.Endpoint},
-			{Name: "AWS_S3_FORCE_PATH_STYLE", Value: "true"},
-		}
+		base = append(base,
+			corev1.EnvVar{Name: "WALG_S3_PREFIX", Value: fmt.Sprintf("s3://%s/%s", spec.S3.Bucket, spec.S3.Prefix)},
+			corev1.EnvVar{Name: "AWS_REGION", Value: spec.S3.Region},
+			corev1.EnvVar{Name: "AWS_ENDPOINT", Value: spec.S3.Endpoint},
+			corev1.EnvVar{Name: "AWS_S3_FORCE_PATH_STYLE", Value: "true"},
+		)
 	case aretev1alpha1.BackupFormatRestic:
-		base = []corev1.EnvVar{
-			{Name: "RESTIC_REPOSITORY",
+		base = append(base,
+			corev1.EnvVar{Name: "RESTIC_REPOSITORY",
 				Value: fmt.Sprintf("s3:%s/%s/%s", spec.S3.Endpoint, spec.S3.Bucket, spec.S3.Prefix)},
-			{Name: "AWS_REGION", Value: spec.S3.Region},
-		}
+			corev1.EnvVar{Name: "AWS_REGION", Value: spec.S3.Region},
+		)
 	}
 	// Append extraEnv pass-throughs. Sorted for deterministic Job spec
 	// (avoids spurious diffs / Job-name churn between reconciles).
