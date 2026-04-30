@@ -124,12 +124,18 @@ spec:
 
     # E4 throughput regression — paged early so you can investigate
     # before the next real DR. 30% drop vs 30d median trips it.
+    #
+    # The 30d quantile is precomputed in the arete.precompute group
+    # (interval 1h) so this alert reads from a recording rule rather
+    # than scanning 30 days of TSDB on every minute. Without that
+    # split, the [30d] window query reads ~all of Prometheus storage
+    # every minute and can sustain 100+ MiB/s of disk I/O alone.
     - alert: AreteE4ThroughputRegressed
       expr: |
         (
           arete_e4_throughput_bytes_per_sec
           /
-          quantile_over_time(0.5, arete_e4_throughput_bytes_per_sec[30d])
+          arete:e4_throughput_bytes_per_sec:quantile50_30d
         ) < 0.7
         and arete_e4_throughput_bytes_per_sec > 0
       for: 1h
@@ -142,4 +148,15 @@ spec:
           at {{`{{ $value | humanize }}x`}} the 30-day median.
           Network or storage backend may be degraded; this directly
           affects RTO.
+
+  # Heavy-compute group — long lookbacks belong here, run hourly so
+  # they don't dominate scrape-interval rule evaluation. Alerts that
+  # consume these metrics live in arete.freshness (interval 1m) and
+  # read from the precomputed series instead of recomputing on every
+  # rule cycle.
+  - name: arete.precompute
+    interval: 1h
+    rules:
+    - record: arete:e4_throughput_bytes_per_sec:quantile50_30d
+      expr: quantile_over_time(0.5, arete_e4_throughput_bytes_per_sec[30d])
 {{- end }}
