@@ -173,16 +173,31 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// Persist the honored force-revalidate timestamp so the same
-	// annotation value doesn't loop. Only update if we actually fired
-	// a fresh validator (jobActive=true after the spawn) — otherwise
-	// the annotation should carry over to the next cycle. Note that
-	// applyStatus snapshots br at entry for its MergeFrom patch, so we
-	// need to pass forceTS through and have applyStatus mutate after
-	// the snapshot — not mutate br here pre-call.
+	// annotation value doesn't loop. With E2/E3/E4 sequencing, a
+	// single force-revalidate annotation needs multiple reconcile
+	// cycles to fire all levels: cycle 1 fires E2, cycle 2 fires E3
+	// (after E2 completes), etc. Only mark force honored when the
+	// LAST level we expect to fire is the one that just spawned this
+	// cycle — that way the annotation remains "live" for follow-up
+	// levels until they get their turn.
+	//
+	// Last expected level depends on what's enabled:
+	//   - sampledRetrievalInterval set → E3 is last
+	//   - sampledRetrievalInterval unset → E2 is last
+	// (E4 is excluded — it's heavy, on-demand, and shouldn't be
+	// forced together with cheap-cycle metadata revalidation.)
 	var honoredForceAt *metav1.Time
-	if force && (e2.jobActive || e3.jobActive) {
-		t := metav1.NewTime(forceTS)
-		honoredForceAt = &t
+	if force {
+		var lastLevelActive bool
+		if br.Spec.SampledRetrievalInterval != nil {
+			lastLevelActive = e3.jobActive
+		} else {
+			lastLevelActive = e2.jobActive
+		}
+		if lastLevelActive {
+			t := metav1.NewTime(forceTS)
+			honoredForceAt = &t
+		}
 	}
 
 	if err := r.applyStatus(ctx, &br, probe, e2, e3, e4, honoredForceAt); err != nil {
