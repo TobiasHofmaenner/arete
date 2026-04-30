@@ -493,6 +493,18 @@ spec:
                   — the validator binary used at E2-E4 is always arete's pinned latest,
                   independent of detected version.
                 type: string
+              lastForceRevalidatedAt:
+                description: |-
+                  lastForceRevalidatedAt records the value of the
+                  `arete.io/force-revalidate` annotation that was most recently
+                  honored. The controller compares the annotation timestamp against
+                  this field on each reconcile: when annotation > status, the
+                  E2/E3 cooldown is bypassed for this cycle and the field is
+                  updated. Lets operators trigger an immediate re-run after a
+                  repository transition (fresh prefix, just-landed first backup,
+                  post-drill) without waiting for the next natural interval.
+                format: date-time
+                type: string
               lastFullRetrieval:
                 description: |-
                   lastFullRetrieval is the result of the most recent E4 Job. Stays nil

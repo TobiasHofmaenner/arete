@@ -18,8 +18,10 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -32,6 +34,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -40,6 +43,28 @@ import (
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
 	aretemetrics "github.com/TobiasHofmaenner/arete/internal/metrics"
 )
+
+// ErrCredentialsSecretNotFound is the sentinel returned by
+// resolveCredentials when the referenced Secret does not exist. The
+// Reconcile loop treats this case specially: a brief gap (e.g. during a
+// DR drill where the tenant namespace is being recreated) is tolerated
+// for credentialsTransientTolerance before any condition flips.
+var ErrCredentialsSecretNotFound = errors.New("credentials secret not found")
+
+// credentialsTransientTolerance bounds how long we wait for a missing
+// Secret to reappear before declaring the BR un-Reachable. Exists so a
+// DR drill that briefly destroys the tenant namespace doesn't take down
+// the BR (and via the BRC, all dependent resources). 60s is roughly an
+// order of magnitude longer than the typical Flux re-create window
+// (5-15s) but well below the fastest valid recovery interval. Status
+// conditions are NOT touched within this window — the BR shows last
+// known-good values.
+const credentialsTransientTolerance = 60 * time.Second
+
+// credentialsTransientRequeue is the requeue interval used while we're
+// waiting for the Secret to reappear. Short enough that recovery is
+// quick, long enough to avoid hot-looping.
+const credentialsTransientRequeue = 30 * time.Second
 
 // ValidatorImages holds the per-format validator container image
 // references the controller passes to Jobs it spawns for E2-E4. Pinned per
@@ -59,6 +84,13 @@ type BackupRepositoryReconciler struct {
 	// controller package free of client-go imports). Optional; when nil,
 	// MetadataValid messages omit the validator's stderr.
 	PodLogs PodLogStreamer
+
+	// credsTransient tracks when each BR first saw its credentials
+	// Secret missing. Populated on first NotFound, cleared on successful
+	// resolveCredentials. Lives in memory: lost on controller restart,
+	// which is acceptable — restart already triggers a full re-reconcile
+	// of every BR. Keyed by NamespacedName, value is time.Time.
+	credsTransient sync.Map
 }
 
 // +kubebuilder:rbac:groups=arete.arete.io,resources=backuprepositories,verbs=get;list;watch;create;update;patch;delete
@@ -75,26 +107,65 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	var br aretev1alpha1.BackupRepository
 	if err := r.Get(ctx, req.NamespacedName, &br); err != nil {
+		// BR deleted: drop any in-memory state for it.
+		r.credsTransient.Delete(req.NamespacedName)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	creds, err := r.resolveCredentials(ctx, &br)
 	if err != nil {
-		log.Info("credentials unavailable", "err", err)
+		// Special-case "Secret transiently missing" so a brief gap (a
+		// few seconds during a DR drill where the tenant namespace is
+		// being torn down + recreated) doesn't flip the BR's status to
+		// degraded — which would in turn make every dependent BRC flip
+		// its decision and tear apart the recovery path itself. Any
+		// other credential error (forbidden, malformed, missing keys)
+		// is reported immediately.
+		if errors.Is(err, ErrCredentialsSecretNotFound) {
+			firstSeen, _ := r.credsTransient.LoadOrStore(req.NamespacedName, time.Now())
+			elapsed := time.Since(firstSeen.(time.Time))
+			if elapsed < credentialsTransientTolerance {
+				log.Info("credentials transiently unavailable; preserving status",
+					"elapsed", elapsed,
+					"tolerance", credentialsTransientTolerance)
+				return ctrl.Result{RequeueAfter: credentialsTransientRequeue}, nil
+			}
+			log.Info("credentials missing beyond tolerance; flipping status",
+				"elapsed", elapsed, "err", err)
+		}
 		return r.recordCredentialsFailure(ctx, &br, err)
 	}
+
+	// Credentials OK — drop any tolerance counter for this BR.
+	r.credsTransient.Delete(req.NamespacedName)
+
+	// Resolve operator-driven force-revalidate. If the BR carries a
+	// fresh `arete.io/force-revalidate=<RFC3339>` annotation that we
+	// haven't yet honored, bypass E2/E3 cooldowns for this cycle. The
+	// annotation timestamp itself becomes status.lastForceRevalidatedAt
+	// after the spawn succeeds, so the same value won't re-trigger.
+	forceTS, force := r.resolveForceRevalidate(&br)
 
 	// E1 probe (in-process; cheap)
 	probe := probeRepository(ctx, br.Spec, creds)
 
 	// E2 Job lifecycle: process any completed Job, maybe spawn a new one
-	e2 := r.processE2(ctx, &br)
+	e2 := r.processE2(ctx, &br, force)
 
 	// E3 Job lifecycle: opt-in via spec.sampledRetrievalInterval
-	e3 := r.processE3(ctx, &br, creds)
+	e3 := r.processE3(ctx, &br, creds, force)
 
 	// E4 Job lifecycle: opt-in via spec.fullRetrievalInterval
 	e4 := r.processE4(ctx, &br)
+
+	// Persist the honored force-revalidate timestamp so the same
+	// annotation value doesn't loop. Only update if we actually fired
+	// a fresh validator (jobActive=true after the spawn) — otherwise
+	// the annotation should carry over to the next cycle.
+	if force && (e2.jobActive || e3.jobActive) {
+		t := metav1.NewTime(forceTS)
+		br.Status.LastForceRevalidatedAt = &t
+	}
 
 	if err := r.applyStatus(ctx, &br, probe, e2, e3, e4); err != nil {
 		log.Error(err, "failed to update status")
@@ -104,6 +175,33 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	publishMetrics(&br)
 
 	return ctrl.Result{RequeueAfter: br.Spec.ProbeInterval.Duration}, nil
+}
+
+// resolveForceRevalidate parses the `arete.io/force-revalidate`
+// annotation. Returns (parsed timestamp, true) if the annotation is
+// fresher than status.lastForceRevalidatedAt; otherwise (zero, false).
+// Malformed timestamps are ignored (logged but not surfaced as a
+// condition — the contract is "honor or skip", never "block").
+func (r *BackupRepositoryReconciler) resolveForceRevalidate(
+	br *aretev1alpha1.BackupRepository,
+) (time.Time, bool) {
+	ann := br.GetAnnotations()[aretev1alpha1.AnnotationForceRevalidate]
+	if ann == "" {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(time.RFC3339, ann)
+	if err != nil {
+		// Try RFC3339Nano too (kubectl annotate with $(date) emits this).
+		ts, err = time.Parse(time.RFC3339Nano, ann)
+		if err != nil {
+			return time.Time{}, false
+		}
+	}
+	if br.Status.LastForceRevalidatedAt != nil &&
+		!ts.After(br.Status.LastForceRevalidatedAt.Time) {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 // publishMetrics snapshots the BackupRepository's status into the
@@ -193,9 +291,11 @@ type e4Outcome struct {
 }
 
 // processE2 inspects existing E2 Jobs for this BR, ingests results from
-// any newly-completed Job, and spawns a fresh Job when due.
+// any newly-completed Job, and spawns a fresh Job when due. Pass
+// force=true to bypass the metadataValidationInterval cooldown (used by
+// the `arete.io/force-revalidate` annotation path).
 func (r *BackupRepositoryReconciler) processE2(
-	ctx context.Context, br *aretev1alpha1.BackupRepository,
+	ctx context.Context, br *aretev1alpha1.BackupRepository, force bool,
 ) e2Outcome {
 	log := logf.FromContext(ctx)
 	out := e2Outcome{}
@@ -225,12 +325,12 @@ func (r *BackupRepositoryReconciler) processE2(
 	}
 
 	// Spawn a new Job if due and none currently running.
-	if !out.jobActive && shouldSpawnE2(br, time.Now()) {
+	if !out.jobActive && (force || shouldSpawnE2(br, time.Now())) {
 		if _, err := r.spawnE2Job(ctx, br); err != nil {
 			log.Error(err, "spawn e2 job")
 		} else {
 			out.jobActive = true
-			log.Info("spawned E2 job", "format", br.Spec.Format)
+			log.Info("spawned E2 job", "format", br.Spec.Format, "force", force)
 		}
 	}
 
@@ -242,7 +342,7 @@ func (r *BackupRepositoryReconciler) processE2(
 // SampledIntegrityValid condition stays absent or stale-True from the
 // previous run.
 func (r *BackupRepositoryReconciler) processE3(
-	ctx context.Context, br *aretev1alpha1.BackupRepository, creds S3Credentials,
+	ctx context.Context, br *aretev1alpha1.BackupRepository, creds S3Credentials, force bool,
 ) e3Outcome {
 	log := logf.FromContext(ctx)
 	out := e3Outcome{}
@@ -271,12 +371,12 @@ func (r *BackupRepositoryReconciler) processE3(
 		}
 	}
 
-	if !out.jobActive && shouldSpawnE3(br, br.Status.VerifiedLastSampledRetrievalAt, time.Now()) {
+	if !out.jobActive && (force || shouldSpawnE3(br, br.Status.VerifiedLastSampledRetrievalAt, time.Now())) {
 		if _, err := r.spawnE3Job(ctx, br, creds); err != nil {
 			log.Error(err, "spawn e3 job")
 		} else {
 			out.jobActive = true
-			log.Info("spawned E3 job", "format", br.Spec.Format)
+			log.Info("spawned E3 job", "format", br.Spec.Format, "force", force)
 		}
 	}
 
@@ -428,7 +528,7 @@ func (r *BackupRepositoryReconciler) resolveCredentials(
 	}
 	if err := r.Get(ctx, key, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return S3Credentials{}, fmt.Errorf("secret %s not found", key)
+			return S3Credentials{}, fmt.Errorf("%w: %s", ErrCredentialsSecretNotFound, key)
 		}
 		return S3Credentials{}, fmt.Errorf("get secret %s: %w", key, err)
 	}
@@ -459,10 +559,12 @@ func secretKeyFor(canonical string, mapping map[string]string) string {
 	return canonical
 }
 
-// recordCredentialsFailure handles the pre-probe failure case (no creds, so
-// we can't reach S3 at all). Sets every E1 sub-condition to False/Unknown
-// with a clear reason, blanks claimed*/observed*/verified* data, and
-// requeues at probeInterval.
+// recordCredentialsFailure handles the pre-probe failure case (no creds,
+// so we can't reach S3 at all). Sets Reachable=False with a clear reason
+// but preserves prior E2/E3/E4 conditions: a credential gap is an
+// observability problem, not evidence that the data on the other side
+// has rotted. When credentials return and validation runs, those
+// preserved conditions get refreshed through the normal path.
 func (r *BackupRepositoryReconciler) recordCredentialsFailure(
 	ctx context.Context, br *aretev1alpha1.BackupRepository, credErr error,
 ) (ctrl.Result, error) {
@@ -472,13 +574,29 @@ func (r *BackupRepositoryReconciler) recordCredentialsFailure(
 	br.Status.ObservedGeneration = br.Generation
 
 	r.applyConditions(br, conditionInputs{
-		reachable: condFalse(aretev1alpha1.ReasonCredentialsUnavailable, credErr.Error()),
+		reachable:              condFalse(aretev1alpha1.ReasonCredentialsUnavailable, credErr.Error()),
+		metadataValid:          preservedCondition(br, aretev1alpha1.ConditionMetadataValid),
+		sampledIntegrityValid:  preservedCondition(br, aretev1alpha1.ConditionSampledIntegrityValid),
+		fullRetrievalCompleted: preservedCondition(br, aretev1alpha1.ConditionFullRetrievalCompleted),
 	})
 
 	if err := r.Status().Patch(ctx, br, patch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: br.Spec.ProbeInterval.Duration}, nil
+}
+
+// preservedCondition returns a copy of the named condition if it
+// represents real (i.e., not LayerTwoNotYetAvailable) state, else nil.
+// Used by recordCredentialsFailure to keep E2/E3/E4 visible across an
+// observability gap rather than blanking them to Unknown.
+func preservedCondition(br *aretev1alpha1.BackupRepository, conditionType string) *metav1.Condition {
+	existing := apimeta.FindStatusCondition(br.Status.Conditions, conditionType)
+	if existing == nil || existing.Reason == aretev1alpha1.ReasonLayerTwoNotYetAvailable {
+		return nil
+	}
+	c := *existing
+	return &c
 }
 
 // applyStatus computes every condition and updates the structured status
@@ -923,17 +1041,21 @@ func (r *BackupRepositoryReconciler) mapSecretToRepositories(
 // SetupWithManager sets up the controller with the Manager.
 //
 // Reconcile triggers:
-//   - For()    — spec changes only (GenerationChangedPredicate). Without
-//     this filter, every status patch we make would re-trigger
-//     Reconcile, producing a tight self-feeding loop because
-//     LastProbedAt updates on every cycle.
+//   - For()    — spec changes (GenerationChangedPredicate) OR
+//     `arete.io/force-revalidate` annotation changes (custom
+//     predicate). Status-only updates are filtered to avoid the
+//     self-feeding loop that LastProbedAt-on-every-cycle would
+//     otherwise produce.
 //   - Owns()   — Job state changes (created/scheduled/complete/deleted).
 //   - Watches()— Secret create/update/delete via mapSecretToRepositories.
 //   - Periodic — Result{RequeueAfter: probeInterval} from each Reconcile.
 func (r *BackupRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&aretev1alpha1.BackupRepository{},
-			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+			builder.WithPredicates(predicate.Or(
+				predicate.GenerationChangedPredicate{},
+				forceRevalidatePredicate{},
+			))).
 		Owns(&batchv1.Job{}).
 		Watches(
 			&corev1.Secret{},
@@ -941,4 +1063,42 @@ func (r *BackupRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Named("backuprepository").
 		Complete(r)
+}
+
+// forceRevalidatePredicate fires Reconcile when the
+// `arete.io/force-revalidate` annotation changes value. Combined with
+// GenerationChangedPredicate via predicate.Or so we still ignore other
+// metadata changes (labels, owner references, status sub-resource).
+//
+// Without this, an operator running
+//
+//	kubectl annotate br foo arete.io/force-revalidate=$(date -u +%FT%TZ)
+//
+// would not wake the reconciler until the next probeInterval (default
+// 10 min) since annotations don't bump generation.
+type forceRevalidatePredicate struct {
+	predicate.Funcs
+}
+
+func (forceRevalidatePredicate) Create(e event.CreateEvent) bool {
+	// Don't trigger on create — the For-watch's GenerationChangedPredicate
+	// already covers the create case via its own Create handler.
+	return false
+}
+
+func (forceRevalidatePredicate) Update(e event.UpdateEvent) bool {
+	if e.ObjectOld == nil || e.ObjectNew == nil {
+		return false
+	}
+	oldVal := e.ObjectOld.GetAnnotations()[aretev1alpha1.AnnotationForceRevalidate]
+	newVal := e.ObjectNew.GetAnnotations()[aretev1alpha1.AnnotationForceRevalidate]
+	return oldVal != newVal
+}
+
+func (forceRevalidatePredicate) Delete(e event.DeleteEvent) bool {
+	return false
+}
+
+func (forceRevalidatePredicate) Generic(e event.GenericEvent) bool {
+	return false
 }

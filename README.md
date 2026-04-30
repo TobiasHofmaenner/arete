@@ -217,6 +217,24 @@ The Helm chart includes:
 
 A Grafana dashboard JSON is shipped separately (see `dist/chart`); standard `grafana_dashboard: "1"` ConfigMap pickup pattern.
 
+## Operator escape hatches
+
+### `arete.io/force-revalidate`
+
+Annotate a `BackupRepository` with an RFC3339 timestamp to bypass the per-level cooldown for a single cycle:
+
+```bash
+kubectl annotate br my-repo arete.io/force-revalidate=$(date -u +%Y-%m-%dT%H:%M:%SZ) --overwrite
+```
+
+The next reconcile spawns E2 (and E3 if enabled) immediately and records the value in `status.lastForceRevalidatedAt`, so the same annotation won't loop. Useful when the repository state changed in a way arete can't observe — e.g., a fresh prefix that just received its first backup, or after pre-existing validators failed against an empty pre-init prefix.
+
+### Transient credentials tolerance
+
+If the `credentialsSecret` referenced by a `BackupRepository` briefly disappears (typically during a tenant-namespace rebuild from a DR drill) the controller does *not* immediately flip the BR to unhealthy. It tolerates a 60-second gap, requeueing every 30s. Beyond that window, `Reachable` flips to `False` (with reason `CredentialsUnavailable`) but `MetadataValid` / `SampledIntegrityValid` / `FullRetrievalCompleted` are preserved at their last known-good values — a credentials gap is an *observability* problem, not evidence the repo data has rotted. Once credentials return and validation runs, conditions refresh through the normal path.
+
+The `BackupRepositoryConditional` controller cooperates with this: when a BR's `Healthy` rollup is `Unknown` (vs definitively `False`) and the BRC has a prior successful decision, the BRC preserves that decision rather than flipping to `whenDegraded` — preventing the recovery path from being torn down by the very disturbance it's recovering from.
+
 ## Design rationale
 
 Summary (full reasoning in the project's ADRs, particularly ADR-022 and ADR-023):

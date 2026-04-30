@@ -444,7 +444,25 @@ type BackupRepositoryStatus struct {
 	// until E4 has been enabled and run at least once.
 	// +optional
 	LastFullRetrieval *FullRetrievalStatus `json:"lastFullRetrieval,omitempty"`
+
+	// lastForceRevalidatedAt records the value of the
+	// `arete.io/force-revalidate` annotation that was most recently
+	// honored. The controller compares the annotation timestamp against
+	// this field on each reconcile: when annotation > status, the
+	// E2/E3 cooldown is bypassed for this cycle and the field is
+	// updated. Lets operators trigger an immediate re-run after a
+	// repository transition (fresh prefix, just-landed first backup,
+	// post-drill) without waiting for the next natural interval.
+	// +optional
+	LastForceRevalidatedAt *metav1.Time `json:"lastForceRevalidatedAt,omitempty"`
 }
+
+// AnnotationForceRevalidate is the BackupRepository annotation that
+// triggers an out-of-band re-run of E2 (and E3 if enabled), bypassing
+// the per-level cooldown. Value MUST be an RFC3339 timestamp; the
+// controller honors it once and records it in
+// status.lastForceRevalidatedAt so the same value doesn't loop.
+const AnnotationForceRevalidate = "arete.io/force-revalidate"
 
 // ----- root resource -----
 

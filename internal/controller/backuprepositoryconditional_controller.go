@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,6 +42,12 @@ import (
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
 )
+
+// transientObservabilityRequeue is how often we re-check while
+// preserving a prior decision through a transient BR observability gap
+// (BR.Healthy=Unknown). Short enough that recovery is quick once BR
+// reports a definitive state again.
+const transientObservabilityRequeue = 30 * time.Second
 
 const (
 	// fieldManager is the SSA field manager identifier the controller
@@ -101,6 +108,34 @@ func (r *BackupRepositoryConditionalReconciler) Reconcile(
 	// 2. Derive state and pick variant.
 	state := deriveBRState(&br)
 	brc.Status.ObservedRepositoryState = string(state)
+
+	// Preserve last decision through transient observability gaps.
+	//
+	// `degraded` here is a rollup that fires whenever Healthy != True —
+	// including the case where Healthy is Unknown because the BR's
+	// credentials Secret briefly disappeared (e.g. a DR drill that
+	// destroys the tenant namespace and then recreates it). In that
+	// scenario flipping the BRC's decision to whenDegraded would tear
+	// down the very recovery path we need to bring the namespace back
+	// up. Hold the line on the prior decision until the BR reports a
+	// definitive state (True or False) again.
+	//
+	// Bounded because BR's own controller flips Reachable=False after
+	// `credentialsTransientTolerance` (60s); after that the rollup is
+	// definitive False and we fall through to the normal degraded path.
+	if state == brStateDegraded && isHealthyUnknown(&br) && brc.Status.Decided != "" {
+		log.Info("BR.Healthy=Unknown; preserving last decision through transient gap",
+			"decided", brc.Status.Decided,
+			"applied", brc.Status.AppliedRef)
+		r.setBRConditionalCondition(&brc,
+			aretev1alpha1.BRConditionalDecided, metav1.ConditionTrue,
+			aretev1alpha1.BRConditionalReasonOK,
+			fmt.Sprintf("preserving prior decision %q through transient BR observability gap",
+				brc.Status.Decided))
+		return ctrl.Result{RequeueAfter: transientObservabilityRequeue},
+			r.Status().Patch(ctx, &brc, patch)
+	}
+
 	variant, slot := pickVariant(brc.Spec, state)
 	if variant == nil {
 		// Refusal is intentional: no variant defined for this state.
@@ -247,6 +282,15 @@ func deriveBRState(br *aretev1alpha1.BackupRepository) brState {
 		return brStateHealthy
 	}
 	return brStateDegraded
+}
+
+// isHealthyUnknown reports whether the BR's Healthy condition is
+// explicitly Unknown (vs True, False, or absent). Used to distinguish
+// "we don't know yet" from "we know it's broken" at the BRC level — the
+// former is preserved through, the latter routed via whenDegraded.
+func isHealthyUnknown(br *aretev1alpha1.BackupRepository) bool {
+	c := apimeta.FindStatusCondition(br.Status.Conditions, aretev1alpha1.ConditionHealthy)
+	return c != nil && c.Status == metav1.ConditionUnknown
 }
 
 // pickVariant returns the variant slot matching the state, plus the
