@@ -96,6 +96,8 @@ backupRepositoryConditional:
   childResourceTargets:
     - apiGroups: ["postgresql.cnpg.io"]
       resources: ["clusters"]
+    - apiGroups: ["volsync.backube"]
+      resources: ["replicationdestinations", "replicationsources"]
 
 # [VALIDATOR IMAGES]: Per-format images the controller spawns as Jobs for
 # E2 metadata validation, E3 sampled retrieval, and E4 full retrieval.
