@@ -161,13 +161,17 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Persist the honored force-revalidate timestamp so the same
 	// annotation value doesn't loop. Only update if we actually fired
 	// a fresh validator (jobActive=true after the spawn) — otherwise
-	// the annotation should carry over to the next cycle.
+	// the annotation should carry over to the next cycle. Note that
+	// applyStatus snapshots br at entry for its MergeFrom patch, so we
+	// need to pass forceTS through and have applyStatus mutate after
+	// the snapshot — not mutate br here pre-call.
+	var honoredForceAt *metav1.Time
 	if force && (e2.jobActive || e3.jobActive) {
 		t := metav1.NewTime(forceTS)
-		br.Status.LastForceRevalidatedAt = &t
+		honoredForceAt = &t
 	}
 
-	if err := r.applyStatus(ctx, &br, probe, e2, e3, e4); err != nil {
+	if err := r.applyStatus(ctx, &br, probe, e2, e3, e4, honoredForceAt); err != nil {
 		log.Error(err, "failed to update status")
 		return ctrl.Result{}, err
 	}
@@ -601,16 +605,23 @@ func preservedCondition(br *aretev1alpha1.BackupRepository, conditionType string
 
 // applyStatus computes every condition and updates the structured status
 // fields from the probe + e2 + e3 + e4 outcomes, then patches the
-// BackupRepository.
+// BackupRepository. honoredForceAt, when non-nil, is the parsed value
+// of the `arete.io/force-revalidate` annotation that this cycle just
+// honored — recorded in status so the same annotation value won't
+// loop. Must be applied after the MergeFrom snapshot below.
 func (r *BackupRepositoryReconciler) applyStatus(
 	ctx context.Context, br *aretev1alpha1.BackupRepository,
 	p probeResult, e2 e2Outcome, e3 e3Outcome, e4 e4Outcome,
+	honoredForceAt *metav1.Time,
 ) error {
 	patch := client.MergeFrom(br.DeepCopy())
 	now := metav1.Now()
 
 	br.Status.LastProbedAt = &now
 	br.Status.ObservedGeneration = br.Generation
+	if honoredForceAt != nil {
+		br.Status.LastForceRevalidatedAt = honoredForceAt
+	}
 	br.Status.DetectedFormat = p.DetectedFormat
 	br.Status.DetectedVersion = p.DetectedVersion
 	br.Status.ClaimedLastSuccessfulBackup = p.LastSuccessfulBackup
