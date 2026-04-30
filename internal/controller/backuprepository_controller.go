@@ -152,11 +152,25 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// E2 Job lifecycle: process any completed Job, maybe spawn a new one
 	e2 := r.processE2(ctx, &br, force)
 
-	// E3 Job lifecycle: opt-in via spec.sampledRetrievalInterval
-	e3 := r.processE3(ctx, &br, creds, force)
+	// E3 Job lifecycle: opt-in via spec.sampledRetrievalInterval.
+	// Sequenced after E2 — restic's `check` (E3) takes an exclusive
+	// repository lock that contends with `snapshots` (E2)'s shared
+	// lock attempt. Naturally rare at default cadence (E2 hourly, E3
+	// 6-hourly) but a force-revalidate annotation fires both at once
+	// and produces a deterministic deadlock on restic repos. Skip E3
+	// while an E2 Job is in flight; it'll fire on the next reconcile.
+	var e3 e3Outcome
+	if !e2.jobActive {
+		e3 = r.processE3(ctx, &br, creds, force)
+	}
 
-	// E4 Job lifecycle: opt-in via spec.fullRetrievalInterval
-	e4 := r.processE4(ctx, &br)
+	// E4 Job lifecycle: opt-in via spec.fullRetrievalInterval.
+	// Same sequencing rationale: full retrieval also exclusive-locks
+	// the restic repo. Skip while either E2 or E3 is in flight.
+	var e4 e4Outcome
+	if !e2.jobActive && !e3.jobActive {
+		e4 = r.processE4(ctx, &br)
+	}
 
 	// Persist the honored force-revalidate timestamp so the same
 	// annotation value doesn't loop. Only update if we actually fired
