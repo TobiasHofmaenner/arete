@@ -529,6 +529,14 @@ func (r *BackupRepositoryReconciler) applyStatus(
 			existing.Reason != aretev1alpha1.ReasonLayerTwoNotYetAvailable {
 			c := *existing
 			metadataValid = &c
+		} else {
+			// Previous validation context is no longer authoritative:
+			// the existing condition is missing or already shows
+			// LayerTwoNotYetAvailable (e.g., reset by an unreachable
+			// cycle when the credentials Secret briefly disappeared).
+			// Clear the timestamp so shouldSpawnE2 fires on the next
+			// reconcile instead of trusting stale freshness.
+			br.Status.VerifiedLastValidationAt = nil
 		}
 	}
 
@@ -544,6 +552,12 @@ func (r *BackupRepositoryReconciler) applyStatus(
 			existing.Reason != aretev1alpha1.ReasonLayerTwoNotYetAvailable {
 			c := *existing
 			sampledIntegrityValid = &c
+		} else {
+			// Mirror E2's logic: condition has been reset to
+			// LayerTwoNotYetAvailable so the previous timestamp is
+			// no longer meaningful — clear it to force a fresh E3
+			// run on the next reconcile.
+			br.Status.VerifiedLastSampledRetrievalAt = nil
 		}
 	}
 
@@ -560,6 +574,12 @@ func (r *BackupRepositoryReconciler) applyStatus(
 			existing.Reason != aretev1alpha1.ReasonLayerTwoNotYetAvailable {
 			c := *existing
 			fullRetrievalCompleted = &c
+		} else {
+			// Mirror E2/E3: existing condition is no longer
+			// authoritative, so the LastFullRetrieval struct (which
+			// shouldSpawnE4 uses as its time anchor via CompletedAt)
+			// is cleared to force a fresh run on next reconcile.
+			br.Status.LastFullRetrieval = nil
 		}
 	}
 
