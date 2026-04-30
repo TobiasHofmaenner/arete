@@ -213,7 +213,7 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 // to fire under the current annotation, or whether its post-annotation
 // run has already completed.
 func levelVerifiedAfter(verified *metav1.Time, ref time.Time) bool {
-	return verified != nil && verified.Time.After(ref)
+	return verified != nil && verified.After(ref)
 }
 
 // resolveForceRevalidate parses the `arete.io/force-revalidate`
