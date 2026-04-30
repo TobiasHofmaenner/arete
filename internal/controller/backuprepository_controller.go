@@ -139,18 +139,31 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Credentials OK — drop any tolerance counter for this BR.
 	r.credsTransient.Delete(req.NamespacedName)
 
-	// Resolve operator-driven force-revalidate. If the BR carries a
-	// fresh `arete.io/force-revalidate=<RFC3339>` annotation that we
-	// haven't yet honored, bypass E2/E3 cooldowns for this cycle. The
-	// annotation timestamp itself becomes status.lastForceRevalidatedAt
-	// after the spawn succeeds, so the same value won't re-trigger.
+	// Resolve operator-driven force-revalidate. The `force` flag is
+	// then narrowed per level: each level honors the annotation
+	// exactly once (via the verifiedLast{Validation,SampledRetrieval}At
+	// > forceTS check below), so a single annotation walks E2 → E3
+	// across reconciles rather than firing the same level repeatedly.
 	forceTS, force := r.resolveForceRevalidate(&br)
+
+	// Per-level force gates. e2/e3 ForceNeeded is true when the
+	// operator wants this level re-validated AND that hasn't yet
+	// happened post-annotation. Avoids re-firing levels every cycle
+	// while the broader force annotation is still "live" (i.e.,
+	// before applyStatus has bumped status.lastForceRevalidatedAt).
+	var e2ForceNeeded, e3ForceNeeded bool
+	if force {
+		e2ForceNeeded = !levelVerifiedAfter(br.Status.VerifiedLastValidationAt, forceTS)
+		if br.Spec.SampledRetrievalInterval != nil {
+			e3ForceNeeded = !levelVerifiedAfter(br.Status.VerifiedLastSampledRetrievalAt, forceTS)
+		}
+	}
 
 	// E1 probe (in-process; cheap)
 	probe := probeRepository(ctx, br.Spec, creds)
 
 	// E2 Job lifecycle: process any completed Job, maybe spawn a new one
-	e2 := r.processE2(ctx, &br, force)
+	e2 := r.processE2(ctx, &br, e2ForceNeeded)
 
 	// E3 Job lifecycle: opt-in via spec.sampledRetrievalInterval.
 	// Sequenced after E2 — restic's `check` (E3) takes an exclusive
@@ -161,7 +174,7 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// while an E2 Job is in flight; it'll fire on the next reconcile.
 	var e3 e3Outcome
 	if !e2.jobActive {
-		e3 = r.processE3(ctx, &br, creds, force)
+		e3 = r.processE3(ctx, &br, creds, e3ForceNeeded)
 	}
 
 	// E4 Job lifecycle: opt-in via spec.fullRetrievalInterval.
@@ -172,32 +185,16 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		e4 = r.processE4(ctx, &br)
 	}
 
-	// Persist the honored force-revalidate timestamp so the same
-	// annotation value doesn't loop. With E2/E3/E4 sequencing, a
-	// single force-revalidate annotation needs multiple reconcile
-	// cycles to fire all levels: cycle 1 fires E2, cycle 2 fires E3
-	// (after E2 completes), etc. Only mark force honored when the
-	// LAST level we expect to fire is the one that just spawned this
-	// cycle — that way the annotation remains "live" for follow-up
-	// levels until they get their turn.
-	//
-	// Last expected level depends on what's enabled:
-	//   - sampledRetrievalInterval set → E3 is last
-	//   - sampledRetrievalInterval unset → E2 is last
-	// (E4 is excluded — it's heavy, on-demand, and shouldn't be
-	// forced together with cheap-cycle metadata revalidation.)
+	// Honor the force annotation in status once every forced level
+	// has produced a verified-after-force result. This is a strict
+	// post-completion check: E2 must have a verifiedLastValidationAt
+	// strictly after forceTS, and E3 (when enabled) likewise. The
+	// honored timestamp lives in status.lastForceRevalidatedAt so
+	// the same annotation value won't re-trigger on later cycles.
 	var honoredForceAt *metav1.Time
-	if force {
-		var lastLevelActive bool
-		if br.Spec.SampledRetrievalInterval != nil {
-			lastLevelActive = e3.jobActive
-		} else {
-			lastLevelActive = e2.jobActive
-		}
-		if lastLevelActive {
-			t := metav1.NewTime(forceTS)
-			honoredForceAt = &t
-		}
+	if force && !e2ForceNeeded && !e3ForceNeeded {
+		t := metav1.NewTime(forceTS)
+		honoredForceAt = &t
 	}
 
 	if err := r.applyStatus(ctx, &br, probe, e2, e3, e4, honoredForceAt); err != nil {
@@ -208,6 +205,15 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	publishMetrics(&br)
 
 	return ctrl.Result{RequeueAfter: br.Spec.ProbeInterval.Duration}, nil
+}
+
+// levelVerifiedAfter reports whether the given verifiedLast* timestamp
+// is set AND strictly after the reference time. Used by the
+// force-revalidate flow to determine whether a level still needs
+// to fire under the current annotation, or whether its post-annotation
+// run has already completed.
+func levelVerifiedAfter(verified *metav1.Time, ref time.Time) bool {
+	return verified != nil && verified.Time.After(ref)
 }
 
 // resolveForceRevalidate parses the `arete.io/force-revalidate`
