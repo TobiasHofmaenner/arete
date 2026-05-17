@@ -242,14 +242,15 @@ func (r *BackupRepositoryReconciler) e4CommandArgsEnv(
 		return []string{"sh", "-c"}, []string{script}, baseEnv, nil
 
 	case aretev1alpha1.BackupFormatRestic:
-		// `stats --mode=restore-size` reports the logical size of the
-		// most-recent snapshot's restorable data — computed from tree
-		// metadata only, no pack reads. Much cheaper than the old
-		// `--mode=raw-data` (which walks every blob in every pack — a
-		// full repo download equivalent to running check twice). The
-		// reported bytes are a slight overestimate vs what check
-		// actually downloads (logical-size vs packed-size), but for
-		// the E4 throughput KPI it's an honest 'data protected' metric.
+		// Bytes reported = actual bytes received over the network during
+		// `restic check --read-data`, measured via a /sys/class/net delta.
+		// Previously we ran `restic stats` to get this — first with
+		// --mode=raw-data (which walks every pack, doubling the work) and
+		// then with --mode=restore-size (cheap but reports the logical
+		// post-dedup-expanded size, giving meaningless throughput
+		// numbers). The net delta is what S3 actually delivered through
+		// the wire (slight ~2% TLS/HTTP overhead inflation acceptable)
+		// and costs us one extra `cat` before + after.
 		//
 		// --retry-lock 15m: lock contention should never be a failure
 		// reason — only genuine "lock never clears" should fail. Same
@@ -260,13 +261,14 @@ func (r *BackupRepositoryReconciler) e4CommandArgsEnv(
 			"rm -rf /work/cache; " +
 			"mkdir -p /work/cache; " +
 			"export RESTIC_CACHE_DIR=/work/cache; " +
-			"BYTES=$(restic --retry-lock 15m stats --mode=restore-size --json 2>/dev/null " +
-			"| grep -oE '\"total_size\":[0-9]+' | awk -F: '{print $2}' | head -1); " +
-			"[ -z \"$BYTES\" ] && BYTES=0; " +
+			"RX_BEFORE=$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0); " +
 			"START=$(date +%s); " +
 			"restic --retry-lock 15m check --read-data 2>&1 | tail -10; " +
 			"RC=$?; " +
 			"END=$(date +%s); " +
+			"RX_AFTER=$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0); " +
+			"BYTES=$((RX_AFTER - RX_BEFORE)); " +
+			"[ $BYTES -lt 0 ] && BYTES=0; " +
 			"DURATION=$((END - START)); " +
 			"[ $DURATION -lt 1 ] && DURATION=1; " +
 			"echo \"STATS rc=$RC duration=$DURATION bytes=$BYTES objects=1 failed=0\"; " +
