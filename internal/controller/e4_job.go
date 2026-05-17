@@ -37,6 +37,12 @@ import (
 
 const labelLevelE4 = "e4"
 
+// labelTriggerSource records who initiated the Job (scheduled vs the
+// arete.io/force-e4 annotation). Read back by ingestE4Result so
+// status.lastFullRetrieval.triggerSource reports the truth instead of
+// defaulting to "scheduled" for every run.
+const labelTriggerSource = "arete.arete.io/trigger-source"
+
 // e4ActiveDeadline caps a single E4 Job at 1 hour. A full restic check
 // --read-data over a multi-GB repo or wal-g backup-fetch of a hot DB
 // can take much longer than E2/E3's 10-minute window.
@@ -128,10 +134,15 @@ func (r *BackupRepositoryReconciler) ensureE4PVC(
 }
 
 // spawnE4Job creates an E4 full-retrieval Job. Provisions the PVC first
-// if missing, then creates the Job that mounts it at /work.
+// if missing, then creates the Job that mounts it at /work. forced is
+// passed through as the trigger-source label so ingest can record it.
 func (r *BackupRepositoryReconciler) spawnE4Job(
-	ctx context.Context, br *aretev1alpha1.BackupRepository,
+	ctx context.Context, br *aretev1alpha1.BackupRepository, forced bool,
 ) (*batchv1.Job, error) {
+	triggerSource := string(aretev1alpha1.TriggerSourceScheduled)
+	if forced {
+		triggerSource = string(aretev1alpha1.TriggerSourceManual)
+	}
 	image, err := r.validatorImageFor(br.Spec.Format)
 	if err != nil {
 		return nil, err
@@ -150,8 +161,9 @@ func (r *BackupRepositoryReconciler) spawnE4Job(
 			Name:      e4JobName(br),
 			Namespace: br.Spec.S3.CredentialsSecret.Namespace,
 			Labels: map[string]string{
-				labelOwnerName: br.Name,
-				labelLevel:     labelLevelE4,
+				labelOwnerName:      br.Name,
+				labelLevel:          labelLevelE4,
+				labelTriggerSource:  triggerSource,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -230,10 +242,14 @@ func (r *BackupRepositoryReconciler) e4CommandArgsEnv(
 		return []string{"sh", "-c"}, []string{script}, baseEnv, nil
 
 	case aretev1alpha1.BackupFormatRestic:
-		// `stats --mode=raw-data` reports total repo bytes — captured
-		// before the read so we can report throughput even though
-		// `check --read-data` doesn't materialize everything to disk.
-		// Then `check --read-data` does the actual full read.
+		// `stats --mode=restore-size` reports the logical size of the
+		// most-recent snapshot's restorable data — computed from tree
+		// metadata only, no pack reads. Much cheaper than the old
+		// `--mode=raw-data` (which walks every blob in every pack — a
+		// full repo download equivalent to running check twice). The
+		// reported bytes are a slight overestimate vs what check
+		// actually downloads (logical-size vs packed-size), but for
+		// the E4 throughput KPI it's an honest 'data protected' metric.
 		//
 		// --retry-lock 15m: lock contention should never be a failure
 		// reason — only genuine "lock never clears" should fail. Same
@@ -244,7 +260,7 @@ func (r *BackupRepositoryReconciler) e4CommandArgsEnv(
 			"rm -rf /work/cache; " +
 			"mkdir -p /work/cache; " +
 			"export RESTIC_CACHE_DIR=/work/cache; " +
-			"BYTES=$(restic --retry-lock 15m stats --mode=raw-data --json 2>/dev/null " +
+			"BYTES=$(restic --retry-lock 15m stats --mode=restore-size --json 2>/dev/null " +
 			"| grep -oE '\"total_size\":[0-9]+' | awk -F: '{print $2}' | head -1); " +
 			"[ -z \"$BYTES\" ] && BYTES=0; " +
 			"START=$(date +%s); " +

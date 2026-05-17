@@ -267,6 +267,22 @@ func (r *BackupRepositoryReconciler) resolveForceRevalidate(
 	return ts, true
 }
 
+// clearForceE4Annotation removes the arete.io/force-e4 annotation
+// from the BR after the corresponding Job has been spawned. Best
+// effort: failure is logged at the call site but doesn't abort the
+// reconcile (the annotation will linger and be re-honored on the
+// next cycle — at worst a duplicate Job runs).
+func (r *BackupRepositoryReconciler) clearForceE4Annotation(
+	ctx context.Context, br *aretev1alpha1.BackupRepository,
+) error {
+	if _, ok := br.GetAnnotations()[aretev1alpha1.AnnotationForceE4]; !ok {
+		return nil
+	}
+	// JSON merge patch: setting the annotation key to null deletes it.
+	patch := []byte(`{"metadata":{"annotations":{"` + aretev1alpha1.AnnotationForceE4 + `":null}}}`)
+	return r.Patch(ctx, br, client.RawPatch(types.MergePatchType, patch))
+}
+
 // resolveForceE4 parses the `arete.io/force-e4` annotation. Returns
 // (parsed timestamp, true) if the annotation is fresher than
 // status.lastForcedE4At; otherwise (zero, false). Mirror of
@@ -557,11 +573,23 @@ func (r *BackupRepositoryReconciler) processE4(
 				"missingPVCSize", br.Spec.FullRetrievalPVCSize == nil)
 			return out
 		}
-		if _, err := r.spawnE4Job(ctx, br); err != nil {
+		if _, err := r.spawnE4Job(ctx, br, forceNeeded); err != nil {
 			log.Error(err, "spawn e4 job")
 		} else {
 			out.jobActive = true
 			log.Info("spawned E4 job", "format", br.Spec.Format, "forced", forceNeeded)
+			// Forced spawns: clear the annotation on the BR right after
+			// the Job exists. Flux SSA's metadata reconciliation tends
+			// to drop the annotation between spawn and ingest otherwise
+			// (caught 2026-05-17 — long-running E4 + 10m Flux interval
+			// = annotation cleared mid-Job, status.lastForcedE4At never
+			// updated). The Job's trigger-source label preserves the
+			// 'this was forced' fact for the eventual ingest.
+			if forceNeeded {
+				if err := r.clearForceE4Annotation(ctx, br); err != nil {
+					log.Error(err, "clear force-e4 annotation")
+				}
+			}
 		}
 	}
 
@@ -578,6 +606,17 @@ func (r *BackupRepositoryReconciler) ingestE4Result(
 ) (*metav1.Condition, *aretev1alpha1.FullRetrievalStatus) {
 	logs := r.readJobOutput(ctx, job)
 	stats := parseE4Stats(logs)
+	// Restore the trigger source from the Job's label — parseE4Stats
+	// can't know what triggered the spawn; spawnE4Job set the label
+	// based on the forceNeeded flag at spawn time.
+	if stats != nil {
+		switch job.Labels[labelTriggerSource] {
+		case string(aretev1alpha1.TriggerSourceManual):
+			stats.TriggerSource = aretev1alpha1.TriggerSourceManual
+		default:
+			stats.TriggerSource = aretev1alpha1.TriggerSourceScheduled
+		}
+	}
 	if !jobSucceeded(job) {
 		return condFalse(
 			aretev1alpha1.ReasonFullRetrievalFailed,
@@ -937,10 +976,16 @@ func (r *BackupRepositoryReconciler) applyConditions(
 	} else {
 		removeCondition(cs, aretev1alpha1.ConditionSampledIntegrityValid)
 	}
-	// FullRetrievalCompleted (E4): present only if E4 enabled. Same
-	// state machine as E3: latest result wins; otherwise distinguish
-	// in-flight from never-run.
-	if br.Spec.FullRetrievalInterval != nil {
+	// FullRetrievalCompleted (E4): emit whenever E4 is meaningful for
+	// this BR — i.e., scheduled (interval set), in-flight, or there's
+	// a prior result to report. The annotation-only path (no interval)
+	// must still surface a condition once E4 has run at least once;
+	// otherwise the operator forces an E4, gets a status.lastFullRetrieval
+	// payload, but sees no condition in `kubectl get br` (silent success).
+	e4Meaningful := br.Spec.FullRetrievalInterval != nil ||
+		br.Status.LastFullRetrieval != nil ||
+		in.e4JobActive
+	if e4Meaningful {
 		switch {
 		case in.fullRetrievalCompleted != nil:
 			setCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted, in.fullRetrievalCompleted)
@@ -949,9 +994,16 @@ func (r *BackupRepositoryReconciler) applyConditions(
 				aretev1alpha1.ReasonLayerTwoNotYetAvailable,
 				"E4 full retrieval Job in flight; result will land on next reconcile"))
 		default:
-			setCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted, condUnknown(
-				aretev1alpha1.ReasonLayerTwoNotYetAvailable,
-				"no E4 full retrieval has completed yet"))
+			// Have a prior LastFullRetrieval but no new completedResult this
+			// cycle — preserve the existing condition rather than blanking.
+			if existing := apimeta.FindStatusCondition(br.Status.Conditions,
+				aretev1alpha1.ConditionFullRetrievalCompleted); existing != nil {
+				setCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted, existing)
+			} else {
+				setCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted, condUnknown(
+					aretev1alpha1.ReasonLayerTwoNotYetAvailable,
+					"no E4 full retrieval has completed yet"))
+			}
 		}
 	} else {
 		removeCondition(cs, aretev1alpha1.ConditionFullRetrievalCompleted)
