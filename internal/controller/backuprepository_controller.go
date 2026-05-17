@@ -499,11 +499,6 @@ func (r *BackupRepositoryReconciler) processE4(
 ) e4Outcome {
 	log := logf.FromContext(ctx)
 	out := e4Outcome{}
-	// Nothing to do if E4 is neither scheduled (interval set) nor
-	// forced for this reconcile (annotation honored upstream).
-	if br.Spec.FullRetrievalInterval == nil && !forceNeeded {
-		return out
-	}
 
 	jobs, err := r.listE4Jobs(ctx, br)
 	if err != nil {
@@ -515,6 +510,12 @@ func (r *BackupRepositoryReconciler) processE4(
 		out.jobActive = true
 	}
 
+	// Ingest any completed Job result unconditionally — even if neither
+	// schedule nor force is active right now, a Job that completed under
+	// a previous force annotation (now cleared) still needs its result
+	// recorded. Without this, a completed E4 from a force trigger that
+	// got its annotation pruned by Flux SSA between spawn and ingest
+	// would never make it into status.lastFullRetrieval.
 	if latest := pickLatestCompletedJob(jobs); latest != nil {
 		completedAt := jobCompletionTime(latest)
 		alreadyIngested := br.Status.LastFullRetrieval != nil &&
@@ -528,6 +529,12 @@ func (r *BackupRepositoryReconciler) processE4(
 			out.stats = stats
 			recordValidationRun(br, "e4", latest)
 		}
+	}
+
+	// Spawn gate: only spawn a new Job when E4 is enabled — either via
+	// schedule (interval set) or via active force annotation.
+	if br.Spec.FullRetrievalInterval == nil && !forceNeeded {
+		return out
 	}
 
 	var lastE4 *metav1.Time
