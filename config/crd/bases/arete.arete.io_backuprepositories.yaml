@@ -151,9 +151,11 @@ spec:
               fullRetrievalInterval:
                 description: |-
                   fullRetrievalInterval is how often the E4 (full retrieval) performance-
-                  test Job runs. Optional — setting it enables E4. Bounded to [1d, 30d]
-                  when set. Can also be triggered manually via the
-                  arete.arete.io/trigger-full-retrieval annotation.
+                  test Job runs on a schedule. Optional — setting it enables recurring
+                  E4 cycles. Bounded to [1d, 30d] when set. Per the 'E4 is on-demand
+                  only' design rule (memory: feedback_arete_e4_on_demand), this should
+                  stay unset for per-tenant defaults; trigger ad-hoc runs via the
+                  arete.io/force-e4 annotation instead.
                 type: string
                 x-kubernetes-validations:
                 - message: fullRetrievalInterval must be between 1d and 30d when set
@@ -166,7 +168,9 @@ spec:
                   fullRetrievalPVCSize is the size of the PVC arete provisions for the
                   E4 Job. Sized for the largest single object only (per-chunk delete keeps
                   steady-state usage at one object's worth, regardless of repo size).
-                  Required iff fullRetrievalInterval is set. Bounded to [1Gi, 100Gi].
+                  Required for E4 to spawn — whether triggered by fullRetrievalInterval
+                  or by the arete.io/force-e4 annotation. Loud error at spawn time if
+                  E4 is requested but this is unset. Bounded to [1Gi, 100Gi].
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
               fullRetrievalStorageClass:
@@ -174,7 +178,9 @@ spec:
                   fullRetrievalStorageClass is the StorageClass arete uses for the PVC
                   that streams E4 downloads. Should match the customer's actual restore
                   storage class so the throughput metric is an honest dress rehearsal.
-                  Required iff fullRetrievalInterval is set.
+                  Required for E4 to spawn — whether triggered by fullRetrievalInterval
+                  or by the arete.io/force-e4 annotation. Loud error at spawn time if
+                  E4 is requested but this is unset.
                 minLength: 1
                 type: string
               maxBackupLag:
@@ -503,6 +509,17 @@ spec:
                   updated. Lets operators trigger an immediate re-run after a
                   repository transition (fresh prefix, just-landed first backup,
                   post-drill) without waiting for the next natural interval.
+                format: date-time
+                type: string
+              lastForcedE4At:
+                description: |-
+                  lastForcedE4At records the value of the `arete.io/force-e4`
+                  annotation that was most recently honored. Same idempotency
+                  pattern as lastForceRevalidatedAt: annotation > status fires
+                  E4 once, the value is written back so the same annotation
+                  doesn't re-loop. Enables on-demand E4 runs without setting
+                  fullRetrievalInterval (which would create a recurring schedule
+                  — explicitly avoided per the 'E4 is on-demand only' design).
                 format: date-time
                 type: string
               lastFullRetrieval:

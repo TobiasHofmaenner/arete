@@ -229,6 +229,18 @@ kubectl annotate br my-repo arete.io/force-revalidate=$(date -u +%Y-%m-%dT%H:%M:
 
 The next reconcile spawns E2 (and E3 if enabled) immediately and records the value in `status.lastForceRevalidatedAt`, so the same annotation won't loop. Useful when the repository state changed in a way arete can't observe — e.g., a fresh prefix that just received its first backup, or after pre-existing validators failed against an empty pre-init prefix.
 
+### `arete.io/force-e4`
+
+Annotate a `BackupRepository` to trigger a one-shot E4 (full retrieval) Job, bypassing the `fullRetrievalInterval` schedule entirely:
+
+```bash
+kubectl annotate br my-repo arete.io/force-e4=$(date -u +%Y-%m-%dT%H:%M:%SZ) --overwrite
+```
+
+The spec must have `fullRetrievalStorageClass` and `fullRetrievalPVCSize` set (the annotation triggers the run but the controller still needs to know where and how big to provision the download PVC) — if either is missing, the spawn is refused loudly in the controller log and the annotation stays pending until the spec is fixed. `fullRetrievalInterval` does NOT need to be set; per the "E4 is on-demand only" design, per-tenant defaults should leave the interval unset and rely on this annotation for ad-hoc runs.
+
+The value is recorded in `status.lastForcedE4At` once the resulting E4 Job completes, so the same annotation won't loop. Bump the timestamp to trigger a fresh run.
+
 ### Transient credentials tolerance
 
 If the `credentialsSecret` referenced by a `BackupRepository` briefly disappears (typically during a tenant-namespace rebuild from a DR drill) the controller does *not* immediately flip the BR to unhealthy. It tolerates a 60-second gap, requeueing every 30s. Beyond that window, `Reachable` flips to `False` (with reason `CredentialsUnavailable`) but `MetadataValid` / `SampledIntegrityValid` / `FullRetrievalCompleted` are preserved at their last known-good values — a credentials gap is an *observability* problem, not evidence the repo data has rotted. Once credentials return and validation runs, conditions refresh through the normal path.

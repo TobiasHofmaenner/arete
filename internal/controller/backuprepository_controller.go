@@ -159,6 +159,20 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
+	// Resolve operator-driven force-e4. Independent annotation from
+	// force-revalidate — E4 is heavy and on-demand-only by design, so
+	// it's controlled separately rather than tagging along with E2/E3.
+	forceE4TS, forceE4 := r.resolveForceE4(&br)
+
+	// E4 hasn't been verified post-annotation iff LastFullRetrieval is
+	// nil OR its CompletedAt is not strictly after forceE4TS.
+	var e4ForceNeeded bool
+	if forceE4 {
+		alreadyPostForce := br.Status.LastFullRetrieval != nil &&
+			br.Status.LastFullRetrieval.CompletedAt.After(forceE4TS)
+		e4ForceNeeded = !alreadyPostForce
+	}
+
 	// E1 probe (in-process; cheap)
 	probe := probeRepository(ctx, br.Spec, creds)
 
@@ -177,12 +191,13 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		e3 = r.processE3(ctx, &br, creds, e3ForceNeeded)
 	}
 
-	// E4 Job lifecycle: opt-in via spec.fullRetrievalInterval.
-	// Same sequencing rationale: full retrieval also exclusive-locks
-	// the restic repo. Skip while either E2 or E3 is in flight.
+	// E4 Job lifecycle: opt-in via spec.fullRetrievalInterval (schedule)
+	// OR the arete.io/force-e4 annotation (on-demand). Same sequencing
+	// rationale: full retrieval also exclusive-locks the restic repo,
+	// so skip while either E2 or E3 is in flight.
 	var e4 e4Outcome
 	if !e2.jobActive && !e3.jobActive {
-		e4 = r.processE4(ctx, &br)
+		e4 = r.processE4(ctx, &br, e4ForceNeeded)
 	}
 
 	// Honor the force annotation in status once every forced level
@@ -197,7 +212,16 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		honoredForceAt = &t
 	}
 
-	if err := r.applyStatus(ctx, &br, probe, e2, e3, e4, honoredForceAt); err != nil {
+	// Same idempotency for force-e4: honor once the post-force E4
+	// has actually completed (signaled by !e4ForceNeeded after this
+	// reconcile's processE4 ingested the Job result).
+	var honoredForceE4At *metav1.Time
+	if forceE4 && !e4ForceNeeded {
+		t := metav1.NewTime(forceE4TS)
+		honoredForceE4At = &t
+	}
+
+	if err := r.applyStatus(ctx, &br, probe, e2, e3, e4, honoredForceAt, honoredForceE4At); err != nil {
 		log.Error(err, "failed to update status")
 		return ctrl.Result{}, err
 	}
@@ -238,6 +262,32 @@ func (r *BackupRepositoryReconciler) resolveForceRevalidate(
 	}
 	if br.Status.LastForceRevalidatedAt != nil &&
 		!ts.After(br.Status.LastForceRevalidatedAt.Time) {
+		return time.Time{}, false
+	}
+	return ts, true
+}
+
+// resolveForceE4 parses the `arete.io/force-e4` annotation. Returns
+// (parsed timestamp, true) if the annotation is fresher than
+// status.lastForcedE4At; otherwise (zero, false). Mirror of
+// resolveForceRevalidate — same idempotency contract: honor once
+// per unique annotation value, never re-loop.
+func (r *BackupRepositoryReconciler) resolveForceE4(
+	br *aretev1alpha1.BackupRepository,
+) (time.Time, bool) {
+	ann := br.GetAnnotations()[aretev1alpha1.AnnotationForceE4]
+	if ann == "" {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(time.RFC3339, ann)
+	if err != nil {
+		ts, err = time.Parse(time.RFC3339Nano, ann)
+		if err != nil {
+			return time.Time{}, false
+		}
+	}
+	if br.Status.LastForcedE4At != nil &&
+		!ts.After(br.Status.LastForcedE4At.Time) {
 		return time.Time{}, false
 	}
 	return ts, true
@@ -445,11 +495,13 @@ func (r *BackupRepositoryReconciler) ingestE3Result(
 // both the "we already ingested this Job" marker and the "due for
 // another run" anchor — no separate VerifiedLastFullRetrievalAt field.
 func (r *BackupRepositoryReconciler) processE4(
-	ctx context.Context, br *aretev1alpha1.BackupRepository,
+	ctx context.Context, br *aretev1alpha1.BackupRepository, forceNeeded bool,
 ) e4Outcome {
 	log := logf.FromContext(ctx)
 	out := e4Outcome{}
-	if br.Spec.FullRetrievalInterval == nil {
+	// Nothing to do if E4 is neither scheduled (interval set) nor
+	// forced for this reconcile (annotation honored upstream).
+	if br.Spec.FullRetrievalInterval == nil && !forceNeeded {
 		return out
 	}
 
@@ -482,12 +534,27 @@ func (r *BackupRepositoryReconciler) processE4(
 	if br.Status.LastFullRetrieval != nil {
 		lastE4 = &br.Status.LastFullRetrieval.CompletedAt
 	}
-	if !out.jobActive && shouldSpawnE4(br, lastE4, time.Now()) {
+	scheduledDue := shouldSpawnE4(br, lastE4, time.Now())
+	if !out.jobActive && (scheduledDue || forceNeeded) {
+		// Spawn-time spec validation. SC + PVCSize aren't required by the
+		// CRD (they're +optional) because they're only meaningful when E4
+		// actually runs. Refuse loudly here if E4 was requested but the
+		// destination is unspecified — preserves the strict contract; the
+		// annotation stays in place and will retry next reconcile once
+		// the operator fixes the spec.
+		if br.Spec.FullRetrievalStorageClass == nil || br.Spec.FullRetrievalPVCSize == nil {
+			log.Error(nil, "E4 requested but spec is incomplete",
+				"forceNeeded", forceNeeded,
+				"scheduledDue", scheduledDue,
+				"missingStorageClass", br.Spec.FullRetrievalStorageClass == nil,
+				"missingPVCSize", br.Spec.FullRetrievalPVCSize == nil)
+			return out
+		}
 		if _, err := r.spawnE4Job(ctx, br); err != nil {
 			log.Error(err, "spawn e4 job")
 		} else {
 			out.jobActive = true
-			log.Info("spawned E4 job", "format", br.Spec.Format)
+			log.Info("spawned E4 job", "format", br.Spec.Format, "forced", forceNeeded)
 		}
 	}
 
@@ -640,14 +707,15 @@ func preservedCondition(br *aretev1alpha1.BackupRepository, conditionType string
 
 // applyStatus computes every condition and updates the structured status
 // fields from the probe + e2 + e3 + e4 outcomes, then patches the
-// BackupRepository. honoredForceAt, when non-nil, is the parsed value
-// of the `arete.io/force-revalidate` annotation that this cycle just
-// honored — recorded in status so the same annotation value won't
-// loop. Must be applied after the MergeFrom snapshot below.
+// BackupRepository. honoredForceAt / honoredForceE4At, when non-nil,
+// are the parsed annotation values that this cycle just honored —
+// recorded in status so the same annotation value won't loop. Must
+// be applied after the MergeFrom snapshot below.
 func (r *BackupRepositoryReconciler) applyStatus(
 	ctx context.Context, br *aretev1alpha1.BackupRepository,
 	p probeResult, e2 e2Outcome, e3 e3Outcome, e4 e4Outcome,
 	honoredForceAt *metav1.Time,
+	honoredForceE4At *metav1.Time,
 ) error {
 	patch := client.MergeFrom(br.DeepCopy())
 	now := metav1.Now()
@@ -656,6 +724,9 @@ func (r *BackupRepositoryReconciler) applyStatus(
 	br.Status.ObservedGeneration = br.Generation
 	if honoredForceAt != nil {
 		br.Status.LastForceRevalidatedAt = honoredForceAt
+	}
+	if honoredForceE4At != nil {
+		br.Status.LastForcedE4At = honoredForceE4At
 	}
 	br.Status.DetectedFormat = p.DetectedFormat
 	br.Status.DetectedVersion = p.DetectedVersion
@@ -1136,9 +1207,14 @@ func (forceRevalidatePredicate) Update(e event.UpdateEvent) bool {
 	if e.ObjectOld == nil || e.ObjectNew == nil {
 		return false
 	}
-	oldVal := e.ObjectOld.GetAnnotations()[aretev1alpha1.AnnotationForceRevalidate]
-	newVal := e.ObjectNew.GetAnnotations()[aretev1alpha1.AnnotationForceRevalidate]
-	return oldVal != newVal
+	oldRev := e.ObjectOld.GetAnnotations()[aretev1alpha1.AnnotationForceRevalidate]
+	newRev := e.ObjectNew.GetAnnotations()[aretev1alpha1.AnnotationForceRevalidate]
+	if oldRev != newRev {
+		return true
+	}
+	oldE4 := e.ObjectOld.GetAnnotations()[aretev1alpha1.AnnotationForceE4]
+	newE4 := e.ObjectNew.GetAnnotations()[aretev1alpha1.AnnotationForceE4]
+	return oldE4 != newE4
 }
 
 func (forceRevalidatePredicate) Delete(e event.DeleteEvent) bool {

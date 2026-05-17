@@ -131,6 +131,84 @@ func TestResolveForceRevalidate_Garbage(t *testing.T) {
 	}
 }
 
+// --- force-e4 mirror of the above ---
+
+func TestResolveForceE4_Empty(t *testing.T) {
+	r := &BackupRepositoryReconciler{}
+	br := &aretev1alpha1.BackupRepository{}
+	if _, ok := r.resolveForceE4(br); ok {
+		t.Fatal("expected ok=false when annotation absent")
+	}
+}
+
+func TestResolveForceE4_FreshAnnotation(t *testing.T) {
+	r := &BackupRepositoryReconciler{}
+	now := time.Now().UTC().Truncate(time.Second)
+	br := &aretev1alpha1.BackupRepository{}
+	br.SetAnnotations(map[string]string{
+		aretev1alpha1.AnnotationForceE4: now.Format(time.RFC3339),
+	})
+	got, ok := r.resolveForceE4(br)
+	if !ok {
+		t.Fatal("expected ok=true for fresh annotation, no prior status")
+	}
+	if !got.Equal(now) {
+		t.Errorf("expected %v, got %v", now, got)
+	}
+}
+
+func TestResolveForceE4_AlreadyHonored(t *testing.T) {
+	r := &BackupRepositoryReconciler{}
+	ts := time.Now().UTC().Truncate(time.Second)
+	br := &aretev1alpha1.BackupRepository{}
+	br.SetAnnotations(map[string]string{
+		aretev1alpha1.AnnotationForceE4: ts.Format(time.RFC3339),
+	})
+	already := metav1.NewTime(ts)
+	br.Status.LastForcedE4At = &already
+	if _, ok := r.resolveForceE4(br); ok {
+		t.Fatal("must not honor an annotation we've already recorded as applied")
+	}
+}
+
+func TestResolveForceE4_OlderThanLast(t *testing.T) {
+	r := &BackupRepositoryReconciler{}
+	older := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
+	newer := time.Now().UTC().Truncate(time.Second)
+	br := &aretev1alpha1.BackupRepository{}
+	br.SetAnnotations(map[string]string{
+		aretev1alpha1.AnnotationForceE4: older.Format(time.RFC3339),
+	})
+	last := metav1.NewTime(newer)
+	br.Status.LastForcedE4At = &last
+	if _, ok := r.resolveForceE4(br); ok {
+		t.Fatal("must reject annotation older than lastForcedE4At")
+	}
+}
+
+func TestResolveForceE4_RFC3339Nano(t *testing.T) {
+	r := &BackupRepositoryReconciler{}
+	now := time.Now().UTC()
+	br := &aretev1alpha1.BackupRepository{}
+	br.SetAnnotations(map[string]string{
+		aretev1alpha1.AnnotationForceE4: now.Format(time.RFC3339Nano),
+	})
+	if _, ok := r.resolveForceE4(br); !ok {
+		t.Fatal("RFC3339Nano must be accepted")
+	}
+}
+
+func TestResolveForceE4_Garbage(t *testing.T) {
+	r := &BackupRepositoryReconciler{}
+	br := &aretev1alpha1.BackupRepository{}
+	br.SetAnnotations(map[string]string{
+		aretev1alpha1.AnnotationForceE4: "not-a-timestamp",
+	})
+	if _, ok := r.resolveForceE4(br); ok {
+		t.Fatal("malformed annotation must be silently ignored, not honored")
+	}
+}
+
 func TestPreservedCondition_RealResultPreserved(t *testing.T) {
 	br := &aretev1alpha1.BackupRepository{}
 	br.Status.Conditions = []metav1.Condition{{

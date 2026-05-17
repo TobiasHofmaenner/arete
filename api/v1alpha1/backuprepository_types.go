@@ -192,9 +192,11 @@ type BackupRepositorySpec struct {
 	SampledRetrievalObjects *int32 `json:"sampledRetrievalObjects,omitempty"`
 
 	// fullRetrievalInterval is how often the E4 (full retrieval) performance-
-	// test Job runs. Optional — setting it enables E4. Bounded to [1d, 30d]
-	// when set. Can also be triggered manually via the
-	// arete.arete.io/trigger-full-retrieval annotation.
+	// test Job runs on a schedule. Optional — setting it enables recurring
+	// E4 cycles. Bounded to [1d, 30d] when set. Per the 'E4 is on-demand
+	// only' design rule (memory: feedback_arete_e4_on_demand), this should
+	// stay unset for per-tenant defaults; trigger ad-hoc runs via the
+	// arete.io/force-e4 annotation instead.
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('24h') && duration(self) <= duration('720h')",message="fullRetrievalInterval must be between 1d and 30d when set"
 	FullRetrievalInterval *metav1.Duration `json:"fullRetrievalInterval,omitempty"`
@@ -202,7 +204,9 @@ type BackupRepositorySpec struct {
 	// fullRetrievalStorageClass is the StorageClass arete uses for the PVC
 	// that streams E4 downloads. Should match the customer's actual restore
 	// storage class so the throughput metric is an honest dress rehearsal.
-	// Required iff fullRetrievalInterval is set.
+	// Required for E4 to spawn — whether triggered by fullRetrievalInterval
+	// or by the arete.io/force-e4 annotation. Loud error at spawn time if
+	// E4 is requested but this is unset.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	FullRetrievalStorageClass *string `json:"fullRetrievalStorageClass,omitempty"`
@@ -210,7 +214,9 @@ type BackupRepositorySpec struct {
 	// fullRetrievalPVCSize is the size of the PVC arete provisions for the
 	// E4 Job. Sized for the largest single object only (per-chunk delete keeps
 	// steady-state usage at one object's worth, regardless of repo size).
-	// Required iff fullRetrievalInterval is set. Bounded to [1Gi, 100Gi].
+	// Required for E4 to spawn — whether triggered by fullRetrievalInterval
+	// or by the arete.io/force-e4 annotation. Loud error at spawn time if
+	// E4 is requested but this is unset. Bounded to [1Gi, 100Gi].
 	// +optional
 	FullRetrievalPVCSize *resource.Quantity `json:"fullRetrievalPVCSize,omitempty"`
 
@@ -455,6 +461,16 @@ type BackupRepositoryStatus struct {
 	// post-drill) without waiting for the next natural interval.
 	// +optional
 	LastForceRevalidatedAt *metav1.Time `json:"lastForceRevalidatedAt,omitempty"`
+
+	// lastForcedE4At records the value of the `arete.io/force-e4`
+	// annotation that was most recently honored. Same idempotency
+	// pattern as lastForceRevalidatedAt: annotation > status fires
+	// E4 once, the value is written back so the same annotation
+	// doesn't re-loop. Enables on-demand E4 runs without setting
+	// fullRetrievalInterval (which would create a recurring schedule
+	// — explicitly avoided per the 'E4 is on-demand only' design).
+	// +optional
+	LastForcedE4At *metav1.Time `json:"lastForcedE4At,omitempty"`
 }
 
 // AnnotationForceRevalidate is the BackupRepository annotation that
@@ -463,6 +479,16 @@ type BackupRepositoryStatus struct {
 // controller honors it once and records it in
 // status.lastForceRevalidatedAt so the same value doesn't loop.
 const AnnotationForceRevalidate = "arete.io/force-revalidate"
+
+// AnnotationForceE4 is the BackupRepository annotation that triggers a
+// one-shot E4 (full retrieval) Job, bypassing the fullRetrievalInterval
+// schedule. Value MUST be an RFC3339 timestamp; the controller honors
+// it once and records it in status.lastForcedE4At so the same value
+// doesn't loop. fullRetrievalStorageClass and fullRetrievalPVCSize
+// must still be set in spec — the annotation triggers the run but
+// the controller needs to know where and how big to provision the
+// download PVC. Loud error if either is missing.
+const AnnotationForceE4 = "arete.io/force-e4"
 
 // ----- root resource -----
 
