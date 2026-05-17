@@ -161,9 +161,9 @@ func (r *BackupRepositoryReconciler) spawnE4Job(
 			Name:      e4JobName(br),
 			Namespace: br.Spec.S3.CredentialsSecret.Namespace,
 			Labels: map[string]string{
-				labelOwnerName:      br.Name,
-				labelLevel:          labelLevelE4,
-				labelTriggerSource:  triggerSource,
+				labelOwnerName:     br.Name,
+				labelLevel:         labelLevelE4,
+				labelTriggerSource: triggerSource,
 			},
 		},
 		Spec: batchv1.JobSpec{
