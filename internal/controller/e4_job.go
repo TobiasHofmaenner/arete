@@ -234,16 +234,21 @@ func (r *BackupRepositoryReconciler) e4CommandArgsEnv(
 		// before the read so we can report throughput even though
 		// `check --read-data` doesn't materialize everything to disk.
 		// Then `check --read-data` does the actual full read.
-		// --retry-lock to queue if E2 holds the exclusive repo lock.
+		//
+		// --retry-lock 15m: lock contention should never be a failure
+		// reason — only genuine "lock never clears" should fail. Same
+		// treatment as E2/E3; E4 is on-demand and the operator can wait
+		// out a VolSync mover holding the lock. See jobActiveDeadline
+		// for the wall-clock upper bound.
 		script := "set -e; " +
 			"rm -rf /work/cache; " +
 			"mkdir -p /work/cache; " +
 			"export RESTIC_CACHE_DIR=/work/cache; " +
-			"BYTES=$(restic --retry-lock 60s stats --mode=raw-data --json 2>/dev/null " +
+			"BYTES=$(restic --retry-lock 15m stats --mode=raw-data --json 2>/dev/null " +
 			"| grep -oE '\"total_size\":[0-9]+' | awk -F: '{print $2}' | head -1); " +
 			"[ -z \"$BYTES\" ] && BYTES=0; " +
 			"START=$(date +%s); " +
-			"restic --retry-lock 60s check --read-data 2>&1 | tail -10; " +
+			"restic --retry-lock 15m check --read-data 2>&1 | tail -10; " +
 			"RC=$?; " +
 			"END=$(date +%s); " +
 			"DURATION=$((END - START)); " +

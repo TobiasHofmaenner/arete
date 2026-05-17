@@ -242,11 +242,15 @@ func restrictedContainerSecurityContext() *corev1.SecurityContext {
 	}
 }
 
-// jobActiveDeadline caps a single Job at 10 minutes. A wal-g backup-list +
-// wal-verify on a healthy repo finishes in seconds; restic check on a
-// large repo can take a few minutes. 10m gives generous headroom and
-// guarantees stuck Jobs get cleaned up before the next cycle.
-const jobActiveDeadline = 10 * time.Minute
+// jobActiveDeadline caps a single Job at 30 minutes. Budget split:
+// up to 15m queued behind a restic repo lock held by another source
+// (typically a VolSync mover during its backup window — confirmed
+// against athenesa/test nextcloud repos), plus up to 15m for the
+// actual validator work (wal-g backup-list is sub-second; restic
+// `check --read-data-subset` on a few GB takes 5–10m). A Job that
+// burns the full 30m wall-clock is the genuine 'lock never clears'
+// case and gets killed loudly — preserves the strict contract.
+const jobActiveDeadline = 30 * time.Minute
 
 // e2JobName produces a deterministic name unique per (BR, time-bucket).
 // Including a short hash of (BR generation + current minute) ensures
@@ -323,14 +327,18 @@ func e2CommandFor(format aretev1alpha1.BackupFormat) []string {
 	case aretev1alpha1.BackupFormatRestic:
 		// restic image ENTRYPOINT is `restic`; override with a shell to
 		// chain check + snapshots --json. RESTIC_CACHE_DIR=/tmp because
-		// the image's nonroot user has no writable home. --retry-lock
-		// queues if E3 (or another job) is holding the exclusive lock
-		// — without it, simultaneous restic Jobs on the same repo
-		// fail-fast with "stale lock" errors.
+		// the image's nonroot user has no writable home.
+		//
+		// --retry-lock 15m: lock contention should never be a failure
+		// reason — only genuine "lock never clears" should fail. The
+		// dominant external lock holder is the VolSync mover during
+		// its backup window, which can run for several minutes on
+		// larger PVCs. 15m generously covers that without crossing
+		// into stuck-lock territory (jobActiveDeadline catches that).
 		return []string{"sh", "-c",
 			"export RESTIC_CACHE_DIR=/tmp && " +
-				"restic --retry-lock 60s check && " +
-				"restic --retry-lock 60s snapshots --json"}
+				"restic --retry-lock 15m check && " +
+				"restic --retry-lock 15m snapshots --json"}
 	}
 	return nil
 }
