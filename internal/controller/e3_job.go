@@ -198,8 +198,14 @@ func (r *BackupRepositoryReconciler) e3CommandArgsEnv(
 		// jobActiveDeadline for the upper bound.
 		approxBytes := target * 16
 		subset := fmt.Sprintf("%dM", approxBytes)
-		script := "export RESTIC_CACHE_DIR=/tmp && " +
-			"restic --retry-lock 15m check --read-data-subset " + subset
+		script := "export RESTIC_CACHE_DIR=/tmp && "
+		if autoCleanStaleLocks(br) {
+			// See e2CommandFor for the safety rationale: `restic unlock`
+			// default semantics only remove locks past the 30 min stale
+			// window, never live ones.
+			script += "restic --retry-lock 15m unlock || true && "
+		}
+		script += "restic --retry-lock 15m check --read-data-subset " + subset
 		return []string{"sh", "-c"}, []string{script}, baseEnv, nil
 	}
 	return nil, nil, nil, fmt.Errorf("E3 not implemented for format %q", br.Spec.Format)

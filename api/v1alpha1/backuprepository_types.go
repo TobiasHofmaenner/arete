@@ -231,6 +231,32 @@ type BackupRepositorySpec struct {
 	// SizeWithinBudget is False with reason SizeBudgetExceeded.
 	// +optional
 	ExpectedSizeBudget *resource.Quantity `json:"expectedSizeBudget,omitempty"`
+
+	// autoCleanStaleLocks, when true, makes E2 and E3 validation Jobs
+	// run `restic unlock` (which removes any lock older than restic's
+	// 30 min stale-lock window) as their first step.
+	//
+	// Closes a recurring papercut on restic repos whose producers
+	// (notably VolSync's restic mover, upstream issue backube/volsync#1042)
+	// don't clean their own orphan locks. A mover SIGKILLed mid-backup
+	// leaves a lock that no subsequent operation auto-removes — restic's
+	// own self-healing only fires when something explicitly calls
+	// `unlock`. With this flag, arete provides that "something" on
+	// every validation cycle.
+	//
+	// Safety: `restic unlock` (no flags) only removes locks beyond the
+	// stale-lock window (default 30 min). It will never remove an active
+	// lock from a real concurrent operation. The flag therefore has no
+	// downside in practice; it is opt-in to preserve existing behavior
+	// on upgrade.
+	//
+	// Only meaningful for format=restic. Silently ignored for wal-g.
+	//
+	// Default: false. Recommended: true for any repo whose producer
+	// is VolSync or similar (no in-band stale-lock handling).
+	//
+	// +optional
+	AutoCleanStaleLocks *bool `json:"autoCleanStaleLocks,omitempty"`
 }
 
 // ----- status sub-types -----

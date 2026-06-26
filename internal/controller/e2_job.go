@@ -157,7 +157,7 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 	if err != nil {
 		return nil, err
 	}
-	cmd := e2CommandFor(br.Spec.Format)
+	cmd := e2CommandFor(br.Spec.Format, autoCleanStaleLocks(br))
 	args := e2ArgsFor(br.Spec.Format)
 
 	job := &batchv1.Job{
@@ -322,7 +322,11 @@ func e2ArgsFor(format aretev1alpha1.BackupFormat) []string {
 // e2CommandFor returns the command override (in addition to args) for
 // formats whose E2 needs to chain multiple binary invocations. Returns
 // nil/empty for formats that work with the image ENTRYPOINT alone.
-func e2CommandFor(format aretev1alpha1.BackupFormat) []string {
+//
+// cleanLocks, when true, prepends `restic unlock || true` so any lock
+// older than restic's 30 min stale-lock window is removed before the
+// validator runs. Wired from BackupRepositorySpec.AutoCleanStaleLocks.
+func e2CommandFor(format aretev1alpha1.BackupFormat, cleanLocks bool) []string {
 	switch format {
 	case aretev1alpha1.BackupFormatRestic:
 		// restic image ENTRYPOINT is `restic`; override with a shell to
@@ -335,12 +339,30 @@ func e2CommandFor(format aretev1alpha1.BackupFormat) []string {
 		// its backup window, which can run for several minutes on
 		// larger PVCs. 15m generously covers that without crossing
 		// into stuck-lock territory (jobActiveDeadline catches that).
-		return []string{"sh", "-c",
-			"export RESTIC_CACHE_DIR=/tmp && " +
-				"restic --retry-lock 15m check && " +
-				"restic --retry-lock 15m snapshots --json"}
+		script := "export RESTIC_CACHE_DIR=/tmp && "
+		if cleanLocks {
+			// Default `restic unlock` only removes locks older than the
+			// 30 min stale-lock window. It cannot disturb a live concurrent
+			// operation, so this is safe to run unconditionally.
+			// `|| true` so a temporary unlock failure (e.g. transient
+			// network blip) doesn't fail the entire validation.
+			script += "restic --retry-lock 15m unlock || true && "
+		}
+		script += "restic --retry-lock 15m check && " +
+			"restic --retry-lock 15m snapshots --json"
+		return []string{"sh", "-c", script}
 	}
 	return nil
+}
+
+// autoCleanStaleLocks reports whether the BR has opted into pre-validation
+// stale-lock cleanup. Centralises the nil-deref + format-gate so callers
+// don't have to repeat the same shape.
+func autoCleanStaleLocks(br *aretev1alpha1.BackupRepository) bool {
+	if br.Spec.Format != aretev1alpha1.BackupFormatRestic {
+		return false
+	}
+	return br.Spec.AutoCleanStaleLocks != nil && *br.Spec.AutoCleanStaleLocks
 }
 
 // credentialEnvVars returns the env vars the validator needs from the

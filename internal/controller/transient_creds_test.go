@@ -13,6 +13,7 @@ package controller
 import (
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -290,6 +291,82 @@ func TestResolveForceE4_UnixEpoch(t *testing.T) {
 	}
 	if !got.Equal(now) {
 		t.Errorf("expected %v, got %v", now, got)
+	}
+}
+
+// --- AutoCleanStaleLocks gating ---
+//
+// Default (field unset/false) must NOT change the existing command,
+// to preserve behavior on upgrade. When opted in, the restic command
+// must prepend `restic unlock` so the lock-cleanup happens before
+// `check` / `snapshots --json` / `read-data-subset`.
+
+func TestAutoCleanStaleLocks_DefaultDisabled(t *testing.T) {
+	br := &aretev1alpha1.BackupRepository{}
+	br.Spec.Format = aretev1alpha1.BackupFormatRestic
+	if autoCleanStaleLocks(br) {
+		t.Fatal("expected false when AutoCleanStaleLocks unset (opt-in)")
+	}
+}
+
+func TestAutoCleanStaleLocks_EnabledOnRestic(t *testing.T) {
+	br := &aretev1alpha1.BackupRepository{}
+	br.Spec.Format = aretev1alpha1.BackupFormatRestic
+	enabled := true
+	br.Spec.AutoCleanStaleLocks = &enabled
+	if !autoCleanStaleLocks(br) {
+		t.Fatal("expected true for restic + AutoCleanStaleLocks=true")
+	}
+}
+
+func TestAutoCleanStaleLocks_IgnoredOnWalg(t *testing.T) {
+	// wal-g has no lock-file concept; the flag is meaningless there
+	// and must be silently dropped (not surface as a malformed-spec
+	// rejection — operators may opt in cluster-wide via a default).
+	br := &aretev1alpha1.BackupRepository{}
+	br.Spec.Format = aretev1alpha1.BackupFormatWalg
+	enabled := true
+	br.Spec.AutoCleanStaleLocks = &enabled
+	if autoCleanStaleLocks(br) {
+		t.Fatal("expected false on wal-g regardless of flag value")
+	}
+}
+
+func TestE2CommandFor_ResticDefault_NoUnlock(t *testing.T) {
+	cmd := e2CommandFor(aretev1alpha1.BackupFormatRestic, false)
+	if len(cmd) != 3 {
+		t.Fatalf("expected sh -c <script>, got %v", cmd)
+	}
+	script := cmd[2]
+	if strings.Contains(script, "unlock") {
+		t.Errorf("default behavior must NOT prepend unlock; got: %q", script)
+	}
+}
+
+func TestE2CommandFor_ResticAutoClean_PrependsUnlock(t *testing.T) {
+	cmd := e2CommandFor(aretev1alpha1.BackupFormatRestic, true)
+	script := cmd[2]
+	if !strings.Contains(script, "restic --retry-lock 15m unlock") {
+		t.Errorf("expected unlock prefix in script; got: %q", script)
+	}
+	if !strings.Contains(script, "|| true") {
+		t.Errorf("unlock must tolerate transient failure (|| true); got: %q", script)
+	}
+	// Order matters: unlock MUST happen before check / snapshots, otherwise
+	// a stale lock kills the check before unlock has a chance to clear it.
+	unlockIdx := strings.Index(script, "unlock")
+	checkIdx := strings.Index(script, "check")
+	if unlockIdx == -1 || checkIdx == -1 || unlockIdx > checkIdx {
+		t.Errorf("unlock must precede check in the script; got: %q", script)
+	}
+}
+
+func TestE2CommandFor_WalgUnaffectedByCleanLocks(t *testing.T) {
+	// wal-g doesn't go through e2CommandFor (returns nil since wal-g
+	// runs the image ENTRYPOINT with args, no Command override). The
+	// cleanLocks flag is ignored.
+	if e2CommandFor(aretev1alpha1.BackupFormatWalg, true) != nil {
+		t.Error("wal-g must not get a Command override regardless of cleanLocks")
 	}
 }
 
