@@ -20,10 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -144,7 +146,7 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// exactly once (via the verifiedLast{Validation,SampledRetrieval}At
 	// > forceTS check below), so a single annotation walks E2 → E3
 	// across reconciles rather than firing the same level repeatedly.
-	forceTS, force := r.resolveForceRevalidate(&br)
+	forceTS, force := r.resolveForceRevalidate(&br, log)
 
 	// Per-level force gates. e2/e3 ForceNeeded is true when the
 	// operator wants this level re-validated AND that hasn't yet
@@ -162,7 +164,7 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Resolve operator-driven force-e4. Independent annotation from
 	// force-revalidate — E4 is heavy and on-demand-only by design, so
 	// it's controlled separately rather than tagging along with E2/E3.
-	forceE4TS, forceE4 := r.resolveForceE4(&br)
+	forceE4TS, forceE4 := r.resolveForceE4(&br, log)
 
 	// E4 hasn't been verified post-annotation iff LastFullRetrieval is
 	// nil OR its CompletedAt is not strictly after forceE4TS.
@@ -243,28 +245,63 @@ func levelVerifiedAfter(verified *metav1.Time, ref time.Time) bool {
 // resolveForceRevalidate parses the `arete.io/force-revalidate`
 // annotation. Returns (parsed timestamp, true) if the annotation is
 // fresher than status.lastForceRevalidatedAt; otherwise (zero, false).
-// Malformed timestamps are ignored (logged but not surfaced as a
-// condition — the contract is "honor or skip", never "block").
+// Malformed timestamps are logged as a warning and ignored — the
+// contract is "honor or skip", never "block".
 func (r *BackupRepositoryReconciler) resolveForceRevalidate(
 	br *aretev1alpha1.BackupRepository,
+	log logr.Logger,
 ) (time.Time, bool) {
 	ann := br.GetAnnotations()[aretev1alpha1.AnnotationForceRevalidate]
 	if ann == "" {
 		return time.Time{}, false
 	}
-	ts, err := time.Parse(time.RFC3339, ann)
-	if err != nil {
-		// Try RFC3339Nano too (kubectl annotate with $(date) emits this).
-		ts, err = time.Parse(time.RFC3339Nano, ann)
-		if err != nil {
-			return time.Time{}, false
-		}
+	ts, ok := parseForceTimestamp(ann)
+	if !ok {
+		log.Info("ignoring malformed force-revalidate annotation",
+			"annotation", aretev1alpha1.AnnotationForceRevalidate,
+			"value", ann,
+			"acceptedFormats", "RFC3339, RFC3339Nano, or Unix epoch seconds")
+		return time.Time{}, false
 	}
 	if br.Status.LastForceRevalidatedAt != nil &&
 		!ts.After(br.Status.LastForceRevalidatedAt.Time) {
 		return time.Time{}, false
 	}
 	return ts, true
+}
+
+// parseForceTimestamp accepts any of the formats an operator is likely
+// to feed via `kubectl annotate`:
+//
+//   - RFC3339, e.g.  $(date -u +%FT%TZ)            → 2026-06-26T14:55:23Z
+//   - RFC3339Nano                                  → 2026-06-26T14:55:23.123456Z
+//   - Unix epoch seconds, e.g. $(date +%s)         → 1782484523
+//
+// The Unix-epoch path is what `$(date +%s)` and most shell wrappers
+// produce by default; accepting it removes a forensics-hostile silent
+// failure mode where the annotation is set but arete ignores it.
+//
+// Returns (ts, true) on success; (zero, false) if none of the formats
+// match. Caller is responsible for logging the failure.
+func parseForceTimestamp(s string) (time.Time, bool) {
+	if ts, err := time.Parse(time.RFC3339, s); err == nil {
+		return ts, true
+	}
+	if ts, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return ts, true
+	}
+	// Unix epoch seconds. ParseInt rejects non-numeric strings so this
+	// won't false-positive on "not-a-timestamp"; a 10-digit value is
+	// roughly 2001-09-09 through 2286, which covers anything an
+	// operator would type today.
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		// Sanity-bound the value so a typo like "1" or "999999999999999999"
+		// doesn't get accepted as a 1970 or year-50000 timestamp.
+		if i >= 1_000_000_000 && i < 100_000_000_000 {
+			return time.Unix(i, 0).UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 // clearForceE4Annotation removes the arete.io/force-e4 annotation
@@ -290,17 +327,19 @@ func (r *BackupRepositoryReconciler) clearForceE4Annotation(
 // per unique annotation value, never re-loop.
 func (r *BackupRepositoryReconciler) resolveForceE4(
 	br *aretev1alpha1.BackupRepository,
+	log logr.Logger,
 ) (time.Time, bool) {
 	ann := br.GetAnnotations()[aretev1alpha1.AnnotationForceE4]
 	if ann == "" {
 		return time.Time{}, false
 	}
-	ts, err := time.Parse(time.RFC3339, ann)
-	if err != nil {
-		ts, err = time.Parse(time.RFC3339Nano, ann)
-		if err != nil {
-			return time.Time{}, false
-		}
+	ts, ok := parseForceTimestamp(ann)
+	if !ok {
+		log.Info("ignoring malformed force-e4 annotation",
+			"annotation", aretev1alpha1.AnnotationForceE4,
+			"value", ann,
+			"acceptedFormats", "RFC3339, RFC3339Nano, or Unix epoch seconds")
+		return time.Time{}, false
 	}
 	if br.Status.LastForcedE4At != nil &&
 		!ts.After(br.Status.LastForcedE4At.Time) {

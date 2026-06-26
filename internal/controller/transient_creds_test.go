@@ -12,15 +12,22 @@ package controller
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
 )
+
+// discardLog is a no-op logger for unit tests that don't care about
+// log output (most of them). Using logr.Discard() instead of a real
+// logger keeps test output clean.
+func discardLog() logr.Logger { return logr.Discard() }
 
 func updateEvent(old, new client.Object) event.UpdateEvent {
 	return event.UpdateEvent{ObjectOld: old, ObjectNew: new}
@@ -54,7 +61,7 @@ func TestErrCredentialsSecretNotFound_Sentinel(t *testing.T) {
 func TestResolveForceRevalidate_Empty(t *testing.T) {
 	r := &BackupRepositoryReconciler{}
 	br := &aretev1alpha1.BackupRepository{}
-	_, ok := r.resolveForceRevalidate(br)
+	_, ok := r.resolveForceRevalidate(br, discardLog())
 	if ok {
 		t.Fatal("expected ok=false when annotation absent")
 	}
@@ -68,7 +75,7 @@ func TestResolveForceRevalidate_FreshAnnotation(t *testing.T) {
 		aretev1alpha1.AnnotationForceRevalidate: now.Format(time.RFC3339),
 	})
 
-	got, ok := r.resolveForceRevalidate(br)
+	got, ok := r.resolveForceRevalidate(br, discardLog())
 	if !ok {
 		t.Fatal("expected ok=true for fresh annotation, no prior status")
 	}
@@ -87,7 +94,7 @@ func TestResolveForceRevalidate_AlreadyHonored(t *testing.T) {
 	already := metav1.NewTime(ts)
 	br.Status.LastForceRevalidatedAt = &already
 
-	if _, ok := r.resolveForceRevalidate(br); ok {
+	if _, ok := r.resolveForceRevalidate(br, discardLog()); ok {
 		t.Fatal("must not honor an annotation we've already recorded as applied")
 	}
 }
@@ -103,7 +110,7 @@ func TestResolveForceRevalidate_OlderThanLast(t *testing.T) {
 	last := metav1.NewTime(newer)
 	br.Status.LastForceRevalidatedAt = &last
 
-	if _, ok := r.resolveForceRevalidate(br); ok {
+	if _, ok := r.resolveForceRevalidate(br, discardLog()); ok {
 		t.Fatal("must reject annotation older than lastForceRevalidatedAt")
 	}
 }
@@ -115,7 +122,7 @@ func TestResolveForceRevalidate_RFC3339Nano(t *testing.T) {
 	br.SetAnnotations(map[string]string{
 		aretev1alpha1.AnnotationForceRevalidate: now.Format(time.RFC3339Nano),
 	})
-	if _, ok := r.resolveForceRevalidate(br); !ok {
+	if _, ok := r.resolveForceRevalidate(br, discardLog()); !ok {
 		t.Fatal("RFC3339Nano (kubectl annotate $(date)) must be accepted")
 	}
 }
@@ -126,7 +133,7 @@ func TestResolveForceRevalidate_Garbage(t *testing.T) {
 	br.SetAnnotations(map[string]string{
 		aretev1alpha1.AnnotationForceRevalidate: "not-a-timestamp",
 	})
-	if _, ok := r.resolveForceRevalidate(br); ok {
+	if _, ok := r.resolveForceRevalidate(br, discardLog()); ok {
 		t.Fatal("malformed annotation must be silently ignored, not honored")
 	}
 }
@@ -136,7 +143,7 @@ func TestResolveForceRevalidate_Garbage(t *testing.T) {
 func TestResolveForceE4_Empty(t *testing.T) {
 	r := &BackupRepositoryReconciler{}
 	br := &aretev1alpha1.BackupRepository{}
-	if _, ok := r.resolveForceE4(br); ok {
+	if _, ok := r.resolveForceE4(br, discardLog()); ok {
 		t.Fatal("expected ok=false when annotation absent")
 	}
 }
@@ -148,7 +155,7 @@ func TestResolveForceE4_FreshAnnotation(t *testing.T) {
 	br.SetAnnotations(map[string]string{
 		aretev1alpha1.AnnotationForceE4: now.Format(time.RFC3339),
 	})
-	got, ok := r.resolveForceE4(br)
+	got, ok := r.resolveForceE4(br, discardLog())
 	if !ok {
 		t.Fatal("expected ok=true for fresh annotation, no prior status")
 	}
@@ -166,7 +173,7 @@ func TestResolveForceE4_AlreadyHonored(t *testing.T) {
 	})
 	already := metav1.NewTime(ts)
 	br.Status.LastForcedE4At = &already
-	if _, ok := r.resolveForceE4(br); ok {
+	if _, ok := r.resolveForceE4(br, discardLog()); ok {
 		t.Fatal("must not honor an annotation we've already recorded as applied")
 	}
 }
@@ -181,7 +188,7 @@ func TestResolveForceE4_OlderThanLast(t *testing.T) {
 	})
 	last := metav1.NewTime(newer)
 	br.Status.LastForcedE4At = &last
-	if _, ok := r.resolveForceE4(br); ok {
+	if _, ok := r.resolveForceE4(br, discardLog()); ok {
 		t.Fatal("must reject annotation older than lastForcedE4At")
 	}
 }
@@ -193,7 +200,7 @@ func TestResolveForceE4_RFC3339Nano(t *testing.T) {
 	br.SetAnnotations(map[string]string{
 		aretev1alpha1.AnnotationForceE4: now.Format(time.RFC3339Nano),
 	})
-	if _, ok := r.resolveForceE4(br); !ok {
+	if _, ok := r.resolveForceE4(br, discardLog()); !ok {
 		t.Fatal("RFC3339Nano must be accepted")
 	}
 }
@@ -204,8 +211,85 @@ func TestResolveForceE4_Garbage(t *testing.T) {
 	br.SetAnnotations(map[string]string{
 		aretev1alpha1.AnnotationForceE4: "not-a-timestamp",
 	})
-	if _, ok := r.resolveForceE4(br); ok {
+	if _, ok := r.resolveForceE4(br, discardLog()); ok {
 		t.Fatal("malformed annotation must be silently ignored, not honored")
+	}
+}
+
+// --- Unix epoch parsing (the format `$(date +%s)` emits) ---
+//
+// Pre-v0.5.33, only RFC3339 / RFC3339Nano were accepted, so the
+// extremely common `kubectl annotate br foo arete.io/force-revalidate=
+// $(date +%s)` invocation silently failed: the annotation was set,
+// arete tried to parse it, time.Parse rejected the integer, and
+// resolveForceRevalidate returned (zero, false) with no log line. The
+// operator saw the annotation persist but no E2/E3 jobs fire — pure
+// debugging hell. Accepting Unix epoch seconds closes that footgun.
+
+func TestParseForceTimestamp_UnixEpoch(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	ts, ok := parseForceTimestamp(strconv.FormatInt(now.Unix(), 10))
+	if !ok {
+		t.Fatal("Unix epoch seconds (10-digit int) must be accepted")
+	}
+	if !ts.Equal(now) {
+		t.Errorf("expected %v, got %v", now, ts)
+	}
+}
+
+func TestParseForceTimestamp_UnixEpochTooSmall(t *testing.T) {
+	// "1" looks like a number but interpreting it as 1970-01-01 00:00:01
+	// would be operator misuse. Reject anything before ~2001.
+	if _, ok := parseForceTimestamp("1"); ok {
+		t.Fatal("trivially small int must not be honored as a timestamp")
+	}
+}
+
+func TestParseForceTimestamp_UnixEpochTooLarge(t *testing.T) {
+	// 100000000000 ≈ year 5138 — likely a typo (millisecond value
+	// pasted instead of seconds). Reject so operator notices.
+	if _, ok := parseForceTimestamp("100000000000"); ok {
+		t.Fatal("absurdly large int must not be honored as a timestamp")
+	}
+}
+
+func TestParseForceTimestamp_Garbage(t *testing.T) {
+	if _, ok := parseForceTimestamp("not-a-timestamp"); ok {
+		t.Fatal("free-form garbage must be rejected")
+	}
+}
+
+func TestResolveForceRevalidate_UnixEpoch(t *testing.T) {
+	// End-to-end: the most common operator invocation.
+	//   kubectl annotate br foo arete.io/force-revalidate=$(date +%s)
+	r := &BackupRepositoryReconciler{}
+	now := time.Now().UTC().Truncate(time.Second)
+	br := &aretev1alpha1.BackupRepository{}
+	br.SetAnnotations(map[string]string{
+		aretev1alpha1.AnnotationForceRevalidate: strconv.FormatInt(now.Unix(), 10),
+	})
+	got, ok := r.resolveForceRevalidate(br, discardLog())
+	if !ok {
+		t.Fatal("Unix epoch annotation (the date-plus-percent-s format) must be accepted")
+	}
+	if !got.Equal(now) {
+		t.Errorf("expected %v, got %v", now, got)
+	}
+}
+
+func TestResolveForceE4_UnixEpoch(t *testing.T) {
+	r := &BackupRepositoryReconciler{}
+	now := time.Now().UTC().Truncate(time.Second)
+	br := &aretev1alpha1.BackupRepository{}
+	br.SetAnnotations(map[string]string{
+		aretev1alpha1.AnnotationForceE4: strconv.FormatInt(now.Unix(), 10),
+	})
+	got, ok := r.resolveForceE4(br, discardLog())
+	if !ok {
+		t.Fatal("Unix epoch annotation must be accepted for force-e4 too")
+	}
+	if !got.Equal(now) {
+		t.Errorf("expected %v, got %v", now, got)
 	}
 }
 
