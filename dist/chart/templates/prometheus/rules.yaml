@@ -108,9 +108,16 @@ spec:
     # If E2 hasn't run successfully in a day, validation has stopped.
     # The default cadence is 6h, so 1d = 4 missed cycles → real
     # problem (controller stuck, persistent Job failures, RBAC, etc).
+    #
+    # `sum by (br)` collapses across pod labels — without it, a single
+    # controller pod restart leaves a stale per-pod counter series in
+    # the [1d] lookback window whose rate evaluates to 0, triggering a
+    # false positive for ~24h after every restart.
     - alert: AreteValidationStopped
       expr: |
-        rate(arete_validation_runs_total{level="e2",result="success"}[1d]) == 0
+        sum by (br) (
+          rate(arete_validation_runs_total{level="e2",result="success"}[1d])
+        ) == 0
         and on(br) arete_condition_state{condition="MetadataValid"}
       for: 1h
       labels:
