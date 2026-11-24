@@ -22,6 +22,7 @@ import (
 	"flag"
 	"io"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -47,6 +48,13 @@ import (
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
+)
+
+// Leader election timing. See the comment at the manager options.
+var (
+	leaseDuration = 60 * time.Second
+	renewDeadline = 45 * time.Second
+	retryPeriod   = 10 * time.Second
 )
 
 func init() {
@@ -83,8 +91,10 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	// Production logging: JSON lines, no stack trace below error level. Pass
+	// --zap-devel for the human-readable development format.
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -165,17 +175,17 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "93fbb8c5.arete.io",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		// The defaults (15s lease, 10s renew deadline) make the manager exit
+		// whenever the API server answers slowly for ten seconds. On a busy
+		// control plane that happened regularly (55 restarts in ten weeks on
+		// the first cluster running arete). Nothing here needs sub-minute
+		// failover, so trade failover speed for tolerance.
+		LeaseDuration: &leaseDuration,
+		RenewDeadline: &renewDeadline,
+		RetryPeriod:   &retryPeriod,
+		// Safe because main returns right after the manager stops: release
+		// the lease on shutdown so a rollout does not wait a full lease.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
