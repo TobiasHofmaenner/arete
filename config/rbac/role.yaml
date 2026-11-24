@@ -7,20 +7,19 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - configmaps
-  - pods
-  - secrets
+  - persistentvolumeclaims
   verbs:
+  - create
+  - delete
   - get
   - list
   - watch
 - apiGroups:
   - ""
   resources:
-  - persistentvolumeclaims
+  - pods
+  - secrets
   verbs:
-  - create
-  - delete
   - get
   - list
   - watch
@@ -34,7 +33,6 @@ rules:
   - arete.arete.io
   resources:
   - backuprepositories
-  - backuprepositoryconditionals
   verbs:
   - create
   - delete
@@ -47,14 +45,12 @@ rules:
   - arete.arete.io
   resources:
   - backuprepositories/finalizers
-  - backuprepositoryconditionals/finalizers
   verbs:
   - update
 - apiGroups:
   - arete.arete.io
   resources:
   - backuprepositories/status
-  - backuprepositoryconditionals/status
   verbs:
   - get
   - patch
