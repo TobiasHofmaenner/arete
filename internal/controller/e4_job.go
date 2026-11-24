@@ -167,15 +167,15 @@ func (r *BackupRepositoryReconciler) spawnE4Job(
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: ptrInt32(600),
-			BackoffLimit:            ptrInt32(0),
-			ActiveDeadlineSeconds:   ptrInt64(int64(e4ActiveDeadline.Seconds())),
+			TTLSecondsAfterFinished: new(int32(600)),
+			BackoffLimit:            new(int32(0)),
+			ActiveDeadlineSeconds:   new(int64(e4ActiveDeadline.Seconds())),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					RestartPolicy:   corev1.RestartPolicyNever,
 					SecurityContext: restrictedPodSecurityContext(),
 					Containers: []corev1.Container{{
-						Name:            "validator",
+						Name:            validatorContainerName,
 						Image:           image,
 						Command:         cmd,
 						Args:            args,

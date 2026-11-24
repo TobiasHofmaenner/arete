@@ -108,15 +108,15 @@ func (r *BackupRepositoryReconciler) spawnE3Job(
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: ptrInt32(600),
-			BackoffLimit:            ptrInt32(0),
-			ActiveDeadlineSeconds:   ptrInt64(int64(jobActiveDeadline.Seconds())),
+			TTLSecondsAfterFinished: new(int32(600)),
+			BackoffLimit:            new(int32(0)),
+			ActiveDeadlineSeconds:   new(int64(jobActiveDeadline.Seconds())),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					RestartPolicy:   corev1.RestartPolicyNever,
 					SecurityContext: restrictedPodSecurityContext(),
 					Containers: []corev1.Container{{
-						Name:            "validator",
+						Name:            validatorContainerName,
 						Image:           image,
 						Command:         cmd,
 						Args:            args,

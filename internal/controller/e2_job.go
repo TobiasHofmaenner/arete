@@ -38,6 +38,9 @@ import (
 
 // Labels arete puts on the Jobs it spawns. Used to find existing Jobs for
 // a given BackupRepository + level on subsequent reconciles.
+// validatorContainerName is the single container in every E2/E3/E4 Job pod.
+const validatorContainerName = "validator"
+
 const (
 	labelOwnerName = "arete.arete.io/backup-repository"
 	labelLevel     = "arete.arete.io/level"
@@ -170,15 +173,15 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: ptrInt32(600),
-			BackoffLimit:            ptrInt32(0), // don't retry; spawn fresh next cycle
-			ActiveDeadlineSeconds:   ptrInt64(int64(jobActiveDeadline.Seconds())),
+			TTLSecondsAfterFinished: new(int32(600)),
+			BackoffLimit:            new(int32(0)), // don't retry; spawn fresh next cycle
+			ActiveDeadlineSeconds:   new(int64(jobActiveDeadline.Seconds())),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					RestartPolicy:   corev1.RestartPolicyNever,
 					SecurityContext: restrictedPodSecurityContext(),
 					Containers: []corev1.Container{{
-						Name:            "validator",
+						Name:            validatorContainerName,
 						Image:           image,
 						Command:         cmd,
 						Args:            args,
@@ -213,10 +216,10 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 // Pod Security Standard.
 func restrictedPodSecurityContext() *corev1.PodSecurityContext {
 	return &corev1.PodSecurityContext{
-		RunAsNonRoot: ptrBool(true),
-		RunAsUser:    ptrInt64(65532), // nonroot — works for any single-binary image
-		RunAsGroup:   ptrInt64(65532),
-		FSGroup:      ptrInt64(65532),
+		RunAsNonRoot: new(true),
+		RunAsUser:    new(int64(65532)), // nonroot — works for any single-binary image
+		RunAsGroup:   new(int64(65532)),
+		FSGroup:      new(int64(65532)),
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},
@@ -231,11 +234,11 @@ func restrictedPodSecurityContext() *corev1.PodSecurityContext {
 // no caps, non-root, runtimeDefault seccomp) are sufficient.
 func restrictedContainerSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
-		AllowPrivilegeEscalation: ptrBool(false),
+		AllowPrivilegeEscalation: new(false),
 		Capabilities: &corev1.Capabilities{
 			Drop: []corev1.Capability{"ALL"},
 		},
-		RunAsNonRoot: ptrBool(true),
+		RunAsNonRoot: new(true),
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},
@@ -443,7 +446,7 @@ func credEnv(canonical, secretName string, mapping map[string]string, optional b
 			SecretKeyRef: &corev1.SecretKeySelector{
 				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
 				Key:                  secretKeyFor(canonical, mapping),
-				Optional:             ptrBool(optional),
+				Optional:             new(optional),
 			},
 		},
 	}
@@ -526,9 +529,3 @@ func (r *BackupRepositoryReconciler) readJobOutput(
 type PodLogStreamer func(
 	ctx context.Context, namespace, name string, tailLines int64,
 ) (io.ReadCloser, error)
-
-// ----- helpers -----
-
-func ptrInt32(v int32) *int32 { return &v }
-func ptrInt64(v int64) *int64 { return &v }
-func ptrBool(v bool) *bool    { return &v }

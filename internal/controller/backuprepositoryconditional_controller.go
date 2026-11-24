@@ -209,7 +209,7 @@ func (r *BackupRepositoryConditionalReconciler) Reconcile(
 	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(&obj),
 		&client.ApplyOptions{
 			FieldManager: brConditionalFieldManager,
-			Force:        ptrBool(true),
+			Force:        new(true),
 		},
 	); err != nil {
 		// Special-case immutable conflicts: cnpg's bootstrap.* is
