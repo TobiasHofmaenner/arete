@@ -28,7 +28,12 @@ jobs:
       - name: Run tests
         run: make test
 
-      # make test regenerates CRDs, RBAC and deepcopy code. A difference here
-      # means generated files were not committed with the change that needs them.
+      - name: Regenerate the chart's CRDs
+        run: make chart-crds
+
+      # make test regenerates CRDs, RBAC and deepcopy code, and make chart-crds
+      # copies the CRDs into the Helm chart. A difference here means generated
+      # files were not committed with the change that needs them. The chart's
+      # CRD once missed a field this way, which made the feature unusable.
       - name: Check generated files are committed
         run: git diff --exit-code
