@@ -388,9 +388,15 @@ const (
 	ReasonBucketSecurityConfigDrift = "BucketSecurityConfigDrift"
 
 	// Backup-state failures (E1)
-	ReasonRepositoryEmpty    = "RepositoryEmpty"
-	ReasonBackupLagExceeded  = "BackupLagExceeded"
-	ReasonSizeBudgetExceeded = "SizeBudgetExceeded"
+	//
+	// RepositoryEmpty means the store answered and there is no backup. It is
+	// never used when the answer could not be obtained: that is
+	// BackupStateUnreadable (or FormatNotImplemented), reported as Unknown.
+	ReasonRepositoryEmpty       = "RepositoryEmpty"
+	ReasonBackupStateUnreadable = "BackupStateUnreadable"
+	ReasonFormatNotImplemented  = "FormatNotImplemented"
+	ReasonBackupLagExceeded     = "BackupLagExceeded"
+	ReasonSizeBudgetExceeded    = "SizeBudgetExceeded"
 
 	// E2-E4 failures
 	ReasonMetadataValidationFailed = "MetadataValidationFailed"

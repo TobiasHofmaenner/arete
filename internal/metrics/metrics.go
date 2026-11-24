@@ -20,10 +20,8 @@ limitations under the License.
 // built-in reconcile/queue metrics.
 //
 // All metrics carry (br, format) labels so PromQL aggregations work
-// per-tenant or per-format. Stale series for deleted BRs hang around
-// until the next controller restart — acceptable for now since BR
-// deletion is rare and Prometheus won't alert on stale metrics if the
-// alert query uses `last_over_time`.
+// per-tenant or per-format. DeleteRepository removes a repository's series
+// when the BackupRepository is deleted.
 package metrics
 
 import (
@@ -131,4 +129,28 @@ func init() {
 		InventoryBytes,
 		ConditionState,
 	)
+}
+
+// perRepository lists every metric labelled by BackupRepository name.
+// Keep in step with the MustRegister call above.
+var perRepository = []interface {
+	DeletePartialMatch(prometheus.Labels) int
+}{
+	ValidationRunsTotal,
+	ValidationDurationSeconds,
+	E4ThroughputBPS,
+	E4BytesTransferred,
+	BackupAgeSeconds,
+	InventoryObjects,
+	InventoryBytes,
+	ConditionState,
+}
+
+// DeleteRepository removes every series that belongs to the named
+// BackupRepository. Call it when the object is deleted; otherwise its last
+// values would be reported until the controller restarts.
+func DeleteRepository(name string) {
+	for _, m := range perRepository {
+		m.DeletePartialMatch(prometheus.Labels{"br": name})
+	}
 }
