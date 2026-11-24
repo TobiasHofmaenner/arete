@@ -2,22 +2,33 @@ name: Tests
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    name: Run on Ubuntu
+    name: test
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      - name: Running Tests
-        run: |
-          go mod tidy
-          make test
+      # Fail instead of silently fixing: go.mod and go.sum must be committed tidy.
+      - name: Check go.mod is tidy
+        run: go mod tidy -diff
+
+      - name: Run tests
+        run: make test
+
+      # make test regenerates CRDs, RBAC and deepcopy code. A difference here
+      # means generated files were not committed with the change that needs them.
+      - name: Check generated files are committed
+        run: git diff --exit-code

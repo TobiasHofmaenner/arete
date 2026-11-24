@@ -31,6 +31,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// labelFormat is the metric label carrying the backup format (restic, walg).
+const labelFormat = "format"
+
 var (
 	// ValidationRunsTotal counts completed E2/E3/E4 Jobs by outcome.
 	// Labels: br, format, level (e2|e3|e4), result (success|failure).
@@ -39,7 +42,7 @@ var (
 			Name: "arete_validation_runs_total",
 			Help: "Total completed E2/E3/E4 validation Jobs by outcome.",
 		},
-		[]string{"br", "format", "level", "result"},
+		[]string{"br", labelFormat, "level", "result"},
 	)
 
 	// ValidationDurationSeconds tracks Job wall-clock time. Buckets cover
@@ -51,7 +54,7 @@ var (
 			Help:    "Wall-clock duration of E2/E3/E4 validation Jobs.",
 			Buckets: prometheus.ExponentialBuckets(1, 2, 12),
 		},
-		[]string{"br", "format", "level"},
+		[]string{"br", labelFormat, "level"},
 	)
 
 	// E4ThroughputBPS mirrors status.lastFullRetrieval.throughputBytesPerSec.
@@ -61,7 +64,7 @@ var (
 			Name: "arete_e4_throughput_bytes_per_sec",
 			Help: "Bytes-per-second from the most recent E4 full retrieval.",
 		},
-		[]string{"br", "format"},
+		[]string{"br", labelFormat},
 	)
 
 	// E4BytesTransferred mirrors status.lastFullRetrieval.bytesTransferred.
@@ -70,7 +73,7 @@ var (
 			Name: "arete_e4_bytes_transferred",
 			Help: "Bytes transferred in the most recent E4 full retrieval.",
 		},
-		[]string{"br", "format"},
+		[]string{"br", labelFormat},
 	)
 
 	// BackupAgeSeconds is now() - claimedLastSuccessfulBackup. Updated
@@ -80,7 +83,7 @@ var (
 			Name: "arete_backup_age_seconds",
 			Help: "Seconds since the most recent successful backup.",
 		},
-		[]string{"br", "format"},
+		[]string{"br", labelFormat},
 	)
 
 	// InventoryObjects mirrors observedInventory.objectCount.
@@ -89,7 +92,7 @@ var (
 			Name: "arete_inventory_objects",
 			Help: "Total objects under the BackupRepository's S3 prefix.",
 		},
-		[]string{"br", "format"},
+		[]string{"br", labelFormat},
 	)
 
 	// InventoryBytes mirrors observedInventory.totalBytes. Trending this
@@ -99,7 +102,7 @@ var (
 			Name: "arete_inventory_bytes",
 			Help: "Total bytes across all objects under the BackupRepository's S3 prefix.",
 		},
-		[]string{"br", "format"},
+		[]string{"br", labelFormat},
 	)
 
 	// ConditionState encodes each BackupRepository condition as a number:
@@ -113,7 +116,7 @@ var (
 			Name: "arete_condition_state",
 			Help: "BackupRepository condition state: 1=True, 0=False, -1=Unknown.",
 		},
-		[]string{"br", "format", "condition"},
+		[]string{"br", labelFormat, "condition"},
 	)
 )
 

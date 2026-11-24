@@ -279,8 +279,7 @@ func checkBucketSecurity(
 // classifyS3Error turns a raw minio-go error into a (reason, message) pair
 // suitable for a Reachable=False condition. CamelCase reason → alert label.
 func classifyS3Error(err error) (string, string) {
-	var resp minio.ErrorResponse
-	if errors.As(err, &resp) {
+	if resp, ok := errors.AsType[minio.ErrorResponse](err); ok {
 		switch resp.Code {
 		case "NoSuchBucket":
 			return aretev1alpha1.ReasonBucketNotFound, resp.Message

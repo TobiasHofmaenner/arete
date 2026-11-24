@@ -1,0 +1,37 @@
+name: Vulnerability check
+
+# Runs on every change and once a week, so a new advisory against an
+# unchanged tree is reported too. Scans the Go standard library as well as
+# modules, and only reports vulnerabilities the code can actually reach.
+#
+# Note: GitHub disables scheduled workflows in public repositories after
+# 60 days without repository activity.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 5 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  # renovate: datasource=go depName=golang.org/x/vuln
+  GOVULNCHECK_VERSION: v1.10.0
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Run govulncheck
+        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...

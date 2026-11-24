@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -693,8 +694,8 @@ func (r *BackupRepositoryReconciler) ingestE2Result(
 // Used to keep the condition message short while still informative.
 func lastLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		l := strings.TrimSpace(lines[i])
+	for _, line := range slices.Backward(lines) {
+		l := strings.TrimSpace(line)
 		if l != "" {
 			if len(l) > 200 {
 				return l[:200] + "..."
