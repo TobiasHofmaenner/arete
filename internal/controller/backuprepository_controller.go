@@ -183,29 +183,25 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// E1 probe (in-process; cheap)
 	probe := probeRepository(ctx, br.Spec, creds)
 
-	// E2 Job lifecycle: process any completed Job, maybe spawn a new one
-	e2 := r.processE2(ctx, &br, e2ForceNeeded)
-
-	// E3 Job lifecycle: opt-in via spec.sampledRetrievalInterval.
-	// Sequenced after E2 — restic's `check` (E3) takes an exclusive
-	// repository lock that contends with `snapshots` (E2)'s shared
-	// lock attempt. Naturally rare at default cadence (E2 hourly, E3
-	// 6-hourly) but a force-revalidate annotation fires both at once
-	// and produces a deterministic deadlock on restic repos. Skip E3
-	// while an E2 Job is in flight; it'll fire on the next reconcile.
-	var e3 e3Outcome
-	if !e2.jobActive {
-		e3 = r.processE3(ctx, &br, creds, e3ForceNeeded)
+	// Validation Jobs (E2 to E4). Two rules:
+	//
+	//   - Finished Jobs are always read, at every level, in every reconcile.
+	//     Jobs delete themselves ten minutes after finishing, so a result
+	//     that is not read promptly is lost.
+	//   - At most one validation Job runs per repository at a time, at any
+	//     level. They contend for the repository lock (restic check takes it
+	//     exclusively), so overlapping runs fail each other and would report
+	//     a healthy repository as invalid. A level that is due while another
+	//     runs starts on a later reconcile, in the order E2, E3, E4.
+	busy, err := r.validationJobInFlight(ctx, &br)
+	if err != nil {
+		// Unknown is treated as busy: better a late run than two at once.
+		log.Error(err, "list validation jobs")
+		busy = true
 	}
-
-	// E4 Job lifecycle: opt-in via spec.fullRetrievalInterval (schedule)
-	// OR the arete.io/force-e4 annotation (on-demand). Same sequencing
-	// rationale: full retrieval also exclusive-locks the restic repo,
-	// so skip while either E2 or E3 is in flight.
-	var e4 e4Outcome
-	if !e2.jobActive && !e3.jobActive {
-		e4 = r.processE4(ctx, &br, e4ForceNeeded)
-	}
+	e2 := r.processE2(ctx, &br, forceTS, e2ForceNeeded, !busy)
+	e3 := r.processE3(ctx, &br, creds, forceTS, e3ForceNeeded, !busy && !e2.jobActive)
+	e4 := r.processE4(ctx, &br, e4ForceNeeded, !busy && !e2.jobActive && !e3.jobActive)
 
 	// Honor the force annotation in status once every forced level
 	// has produced a verified-after-force result. This is a strict
@@ -268,11 +264,29 @@ func (r *BackupRepositoryReconciler) resolveForceRevalidate(
 			"acceptedFormats", "RFC3339, RFC3339Nano, or Unix epoch seconds")
 		return time.Time{}, false
 	}
+	if forceTimestampInFuture(ts, time.Now()) {
+		log.Info("ignoring force-revalidate annotation with a timestamp in the future",
+			"annotation", aretev1alpha1.AnnotationForceRevalidate, "value", ann)
+		return time.Time{}, false
+	}
 	if br.Status.LastForceRevalidatedAt != nil &&
 		!ts.After(br.Status.LastForceRevalidatedAt.Time) {
 		return time.Time{}, false
 	}
 	return ts, true
+}
+
+// forceTimestampMaxSkew is how far ahead of the controller's clock a force
+// annotation's timestamp may be.
+const forceTimestampMaxSkew = 5 * time.Minute
+
+// forceTimestampInFuture reports whether ts lies further in the future than
+// clock skew explains. A run only counts as "after the annotation" once it
+// finishes later than ts, so a far-future value (a typo in the year, a
+// laptop clock that is ahead) would restart validation back to back until
+// the wall clock caught up.
+func forceTimestampInFuture(ts, now time.Time) bool {
+	return ts.After(now.Add(forceTimestampMaxSkew))
 }
 
 // parseForceTimestamp accepts any of the formats an operator is likely
@@ -344,6 +358,11 @@ func (r *BackupRepositoryReconciler) resolveForceE4(
 			"annotation", aretev1alpha1.AnnotationForceE4,
 			"value", ann,
 			"acceptedFormats", "RFC3339, RFC3339Nano, or Unix epoch seconds")
+		return time.Time{}, false
+	}
+	if forceTimestampInFuture(ts, time.Now()) {
+		log.Info("ignoring force-e4 annotation with a timestamp in the future",
+			"annotation", aretev1alpha1.AnnotationForceE4, "value", ann)
 		return time.Time{}, false
 	}
 	if br.Status.LastForcedE4At != nil &&
@@ -466,11 +485,13 @@ type e4Outcome struct {
 }
 
 // processE2 inspects existing E2 Jobs for this BR, ingests results from
-// any newly-completed Job, and spawns a fresh Job when due. Pass
-// force=true to bypass the metadataValidationInterval cooldown (used by
-// the `arete.io/force-revalidate` annotation path).
+// any newly-completed Job, and spawns a fresh Job when due and allowed.
+// force bypasses the metadataValidationInterval cooldown for the
+// `arete.io/force-revalidate` annotation whose timestamp is forceTS.
+// allowSpawn is false while another validation Job runs for this BR.
 func (r *BackupRepositoryReconciler) processE2(
-	ctx context.Context, br *aretev1alpha1.BackupRepository, force bool,
+	ctx context.Context, br *aretev1alpha1.BackupRepository,
+	forceTS time.Time, force, allowSpawn bool,
 ) e2Outcome {
 	log := logf.FromContext(ctx)
 	out := e2Outcome{}
@@ -499,8 +520,12 @@ func (r *BackupRepositoryReconciler) processE2(
 		}
 	}
 
-	// Spawn a new Job if due and none currently running.
-	if !out.jobActive && (force || shouldSpawnE2(br, time.Now())) {
+	// Spawn a new Job if due and none currently running. Both checks use
+	// the newest finished run, including one ingested just above: status is
+	// not patched yet, and checking against it re-ran every validation.
+	lastE2 := latestCompletion(br.Status.VerifiedLastValidationAt, jobs)
+	force = force && !levelVerifiedAfter(lastE2, forceTS)
+	if allowSpawn && !out.jobActive && (force || shouldSpawnE2(br, lastE2, time.Now())) {
 		if _, err := r.spawnE2Job(ctx, br); err != nil {
 			log.Error(err, "spawn e2 job")
 		} else {
@@ -517,7 +542,8 @@ func (r *BackupRepositoryReconciler) processE2(
 // SampledIntegrityValid condition stays absent or stale-True from the
 // previous run.
 func (r *BackupRepositoryReconciler) processE3(
-	ctx context.Context, br *aretev1alpha1.BackupRepository, creds S3Credentials, force bool,
+	ctx context.Context, br *aretev1alpha1.BackupRepository, creds S3Credentials,
+	forceTS time.Time, force, allowSpawn bool,
 ) e3Outcome {
 	log := logf.FromContext(ctx)
 	out := e3Outcome{}
@@ -546,7 +572,9 @@ func (r *BackupRepositoryReconciler) processE3(
 		}
 	}
 
-	if !out.jobActive && (force || shouldSpawnE3(br, br.Status.VerifiedLastSampledRetrievalAt, time.Now())) {
+	lastE3 := latestCompletion(br.Status.VerifiedLastSampledRetrievalAt, jobs)
+	force = force && !levelVerifiedAfter(lastE3, forceTS)
+	if allowSpawn && !out.jobActive && (force || shouldSpawnE3(br, lastE3, time.Now())) {
 		if _, err := r.spawnE3Job(ctx, br, creds); err != nil {
 			log.Error(err, "spawn e3 job")
 		} else {
@@ -581,7 +609,7 @@ func (r *BackupRepositoryReconciler) ingestE3Result(
 // both the "we already ingested this Job" marker and the "due for
 // another run" anchor — no separate VerifiedLastFullRetrievalAt field.
 func (r *BackupRepositoryReconciler) processE4(
-	ctx context.Context, br *aretev1alpha1.BackupRepository, forceNeeded bool,
+	ctx context.Context, br *aretev1alpha1.BackupRepository, forceNeeded, allowSpawn bool,
 ) e4Outcome {
 	log := logf.FromContext(ctx)
 	out := e4Outcome{}
@@ -609,9 +637,15 @@ func (r *BackupRepositoryReconciler) processE4(
 		if !alreadyIngested {
 			cond, stats := r.ingestE4Result(ctx, latest)
 			out.completedResult = cond
-			if stats != nil {
-				stats.CompletedAt = metav1.NewTime(completedAt)
+			if stats == nil {
+				// The Job ended without a STATS line: killed at its deadline,
+				// evicted, or it crashed. Record that a run finished anyway.
+				// Without this the same Job would be read again on every
+				// reconcile, a scheduled E4 would restart at once, and a
+				// failed on-demand E4 would vanish from status.
+				stats = &aretev1alpha1.FullRetrievalStatus{TriggerSource: e4TriggerSource(latest)}
 			}
+			stats.CompletedAt = metav1.NewTime(completedAt)
 			out.stats = stats
 			recordValidationRun(br, "e4", latest)
 		}
@@ -627,8 +661,9 @@ func (r *BackupRepositoryReconciler) processE4(
 	if br.Status.LastFullRetrieval != nil {
 		lastE4 = &br.Status.LastFullRetrieval.CompletedAt
 	}
+	lastE4 = latestCompletion(lastE4, jobs)
 	scheduledDue := shouldSpawnE4(br, lastE4, time.Now())
-	if !out.jobActive && (scheduledDue || forceNeeded) {
+	if allowSpawn && !out.jobActive && (scheduledDue || forceNeeded) {
 		// Spawn-time spec validation. SC + PVCSize aren't required by the
 		// CRD (they're +optional) because they're only meaningful when E4
 		// actually runs. Refuse loudly here if E4 was requested but the
@@ -666,6 +701,15 @@ func (r *BackupRepositoryReconciler) processE4(
 	return out
 }
 
+// e4TriggerSource reads from the Job's label whether the run was started
+// on demand or by the schedule.
+func e4TriggerSource(job *batchv1.Job) aretev1alpha1.TriggerSource {
+	if job.Labels[labelTriggerSource] == string(aretev1alpha1.TriggerSourceManual) {
+		return aretev1alpha1.TriggerSourceManual
+	}
+	return aretev1alpha1.TriggerSourceScheduled
+}
+
 // ingestE4Result turns a finished E4 Job into a (FullRetrievalCompleted
 // condition, FullRetrievalStatus) pair. The condition reflects exit
 // code; the stats come from the validator's STATS line. On failure we
@@ -680,12 +724,7 @@ func (r *BackupRepositoryReconciler) ingestE4Result(
 	// can't know what triggered the spawn; spawnE4Job set the label
 	// based on the forceNeeded flag at spawn time.
 	if stats != nil {
-		switch job.Labels[labelTriggerSource] {
-		case string(aretev1alpha1.TriggerSourceManual):
-			stats.TriggerSource = aretev1alpha1.TriggerSourceManual
-		default:
-			stats.TriggerSource = aretev1alpha1.TriggerSourceScheduled
-		}
+		stats.TriggerSource = e4TriggerSource(job)
 	}
 	if !jobSucceeded(job) {
 		return condFalse(

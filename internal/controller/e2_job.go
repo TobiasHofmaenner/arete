@@ -48,13 +48,75 @@ const (
 )
 
 // shouldSpawnE2 returns true if metadataValidationInterval has elapsed
-// since the last verifiedLastValidationAt — or if no E2 has run at all.
-func shouldSpawnE2(br *aretev1alpha1.BackupRepository, now time.Time) bool {
-	if br.Status.VerifiedLastValidationAt == nil {
+// since the last E2 run finished — or if no E2 has run at all. lastE2 must
+// include a run ingested in the current reconcile (see latestCompletion).
+func shouldSpawnE2(br *aretev1alpha1.BackupRepository, lastE2 *metav1.Time, now time.Time) bool {
+	if lastE2 == nil {
 		return true
 	}
-	return now.Sub(br.Status.VerifiedLastValidationAt.Time) >=
-		br.Spec.MetadataValidationInterval.Duration
+	return now.Sub(lastE2.Time) >= br.Spec.MetadataValidationInterval.Duration
+}
+
+// latestCompletion returns the later of the recorded completion time and the
+// completion time of the newest finished Job in jobs.
+//
+// The "is a run due?" check must use it. Status is only patched at the end
+// of a reconcile, so in the reconcile that ingests a finished Job the
+// recorded time is still the previous run's: checking against it started a
+// second Job straight after every first one.
+func latestCompletion(recorded *metav1.Time, jobs []batchv1.Job) *metav1.Time {
+	latest := pickLatestCompletedJob(jobs)
+	if latest == nil {
+		return recorded
+	}
+	done := metav1.NewTime(jobCompletionTime(latest))
+	if recorded != nil && !done.After(recorded.Time) {
+		return recorded
+	}
+	return &done
+}
+
+// listValidationJobs returns the validation Jobs arete spawned for br at the
+// given level, or at every level when level is "".
+//
+// Only Jobs controlled by this very object count. Labels alone can be set by
+// anyone allowed to create Jobs in the namespace, and an object that was
+// deleted and re-created under the same name must not inherit the Jobs of
+// its predecessor.
+func (r *BackupRepositoryReconciler) listValidationJobs(
+	ctx context.Context, br *aretev1alpha1.BackupRepository, level string,
+) ([]batchv1.Job, error) {
+	selector := client.MatchingLabels{labelOwnerName: br.Name}
+	if level != "" {
+		selector[labelLevel] = level
+	}
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs,
+		client.InNamespace(br.Spec.S3.CredentialsSecret.Namespace), selector,
+	); err != nil {
+		return nil, err
+	}
+	owned := make([]batchv1.Job, 0, len(jobs.Items))
+	for i := range jobs.Items {
+		if metav1.IsControlledBy(&jobs.Items[i], br) {
+			owned = append(owned, jobs.Items[i])
+		}
+	}
+	return owned, nil
+}
+
+// validationJobInFlight reports whether a validation Job of any level is
+// still running for br. arete runs at most one per repository at a time:
+// the levels contend for the repository lock (restic check takes it
+// exclusively), so overlapping runs fail each other.
+func (r *BackupRepositoryReconciler) validationJobInFlight(
+	ctx context.Context, br *aretev1alpha1.BackupRepository,
+) (bool, error) {
+	jobs, err := r.listValidationJobs(ctx, br, "")
+	if err != nil {
+		return false, err
+	}
+	return firstActiveJob(jobs) != nil, nil
 }
 
 // listE2Jobs returns all E2 Jobs the controller has spawned for the given
@@ -62,17 +124,7 @@ func shouldSpawnE2(br *aretev1alpha1.BackupRepository, now time.Time) bool {
 func (r *BackupRepositoryReconciler) listE2Jobs(
 	ctx context.Context, br *aretev1alpha1.BackupRepository,
 ) ([]batchv1.Job, error) {
-	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs,
-		client.InNamespace(br.Spec.S3.CredentialsSecret.Namespace),
-		client.MatchingLabels{
-			labelOwnerName: br.Name,
-			labelLevel:     labelLevelE2,
-		},
-	); err != nil {
-		return nil, err
-	}
-	return jobs.Items, nil
+	return r.listValidationJobs(ctx, br, labelLevelE2)
 }
 
 // jobInFlight reports whether a Job has neither completed nor failed
@@ -186,10 +238,7 @@ func (r *BackupRepositoryReconciler) spawnE2Job(
 						Command:         cmd,
 						Args:            args,
 						SecurityContext: restrictedContainerSecurityContext(),
-						Env: append(
-							credentialEnvVars(br.Spec),
-							e2EnvFor(br.Spec)...,
-						),
+						Env:             validatorEnv(br.Spec),
 					}},
 				},
 			},
@@ -352,7 +401,7 @@ func e2CommandFor(format aretev1alpha1.BackupFormat, cleanLocks bool) []string {
 			script += "restic --retry-lock 15m unlock || true && "
 		}
 		script += "restic --retry-lock 15m check && " +
-			"restic --retry-lock 15m snapshots --json"
+			"restic --retry-lock 15m snapshots --latest 1 --json"
 		return []string{"sh", "-c", script}
 	}
 	return nil
@@ -459,33 +508,72 @@ func credEnv(canonical, secretName string, mapping map[string]string, optional b
 // must mirror).
 func e2EnvFor(spec aretev1alpha1.BackupRepositorySpec) []corev1.EnvVar {
 	base := make([]corev1.EnvVar, 0, 4+len(spec.S3.ExtraEnv))
+
+	// extraEnv pass-throughs come first, so a name arete sets itself below
+	// wins over the same name in extraEnv (for duplicate names the last
+	// entry wins). Sorted for a deterministic Job spec. Names that would
+	// make the validator run a command or read another repository are
+	// dropped here as well as rejected by the CRD.
+	keys := make([]string, 0, len(spec.S3.ExtraEnv))
+	for k := range spec.S3.ExtraEnv {
+		if !forbiddenExtraEnv(k) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		base = append(base, corev1.EnvVar{Name: k, Value: escapeEnvRefs(spec.S3.ExtraEnv[k])})
+	}
+
 	switch spec.Format {
 	case aretev1alpha1.BackupFormatWalg:
 		base = append(base,
-			corev1.EnvVar{Name: "WALG_S3_PREFIX", Value: fmt.Sprintf("s3://%s/%s", spec.S3.Bucket, spec.S3.Prefix)},
-			corev1.EnvVar{Name: "AWS_REGION", Value: spec.S3.Region},
-			corev1.EnvVar{Name: "AWS_ENDPOINT", Value: spec.S3.Endpoint},
+			corev1.EnvVar{Name: "WALG_S3_PREFIX",
+				Value: escapeEnvRefs(fmt.Sprintf("s3://%s/%s", spec.S3.Bucket, spec.S3.Prefix))},
+			corev1.EnvVar{Name: "AWS_REGION", Value: escapeEnvRefs(spec.S3.Region)},
+			corev1.EnvVar{Name: "AWS_ENDPOINT", Value: escapeEnvRefs(spec.S3.Endpoint)},
 			corev1.EnvVar{Name: "AWS_S3_FORCE_PATH_STYLE", Value: "true"},
 		)
 	case aretev1alpha1.BackupFormatRestic:
 		base = append(base,
 			corev1.EnvVar{Name: "RESTIC_REPOSITORY",
-				Value: fmt.Sprintf("s3:%s/%s/%s", spec.S3.Endpoint, spec.S3.Bucket, spec.S3.Prefix)},
-			corev1.EnvVar{Name: "AWS_REGION", Value: spec.S3.Region},
+				Value: escapeEnvRefs(fmt.Sprintf("s3:%s/%s/%s", spec.S3.Endpoint, spec.S3.Bucket, spec.S3.Prefix))},
+			corev1.EnvVar{Name: "AWS_REGION", Value: escapeEnvRefs(spec.S3.Region)},
 		)
-	}
-	// Append extraEnv pass-throughs. Sorted for deterministic Job spec
-	// (avoids spurious diffs / Job-name churn between reconciles).
-	keys := make([]string, 0, len(spec.S3.ExtraEnv))
-	for k := range spec.S3.ExtraEnv {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		base = append(base, corev1.EnvVar{Name: k, Value: spec.S3.ExtraEnv[k]})
 	}
 	return base
 }
+
+// validatorEnv is the complete environment of a validator container.
+//
+// The order is deliberate. Kubernetes expands $(NAME) inside a literal value
+// from variables defined earlier in the list, and for duplicate names the
+// last entry wins. Literals taken from the spec therefore come first, with
+// "$(" escaped, and the secret-backed credentials come last: no value from
+// the spec can copy a secret into a plain variable (where it would end up
+// in the validator's output and from there in status), and none can replace
+// a credential.
+func validatorEnv(spec aretev1alpha1.BackupRepositorySpec) []corev1.EnvVar {
+	return append(e2EnvFor(spec), credentialEnvVars(spec)...)
+}
+
+// escapeEnvRefs neutralises Kubernetes' $(NAME) expansion in an env value:
+// "$$(" is the documented escape for a literal "$(".
+func escapeEnvRefs(v string) string {
+	return strings.ReplaceAll(v, "$(", "$$(")
+}
+
+// forbiddenExtraEnvNames are variables that must not be set through
+// spec.s3.extraEnv: they make the validator execute a command, load code,
+// or read its repository location or password from somewhere other than
+// the spec. Keep in step with the CEL rule on S3Source.ExtraEnv.
+var forbiddenExtraEnvNames = map[string]bool{
+	"PATH": true, "LD_PRELOAD": true, "LD_LIBRARY_PATH": true,
+	"RESTIC_PASSWORD_COMMAND": true, "RESTIC_PASSWORD_FILE": true, "RESTIC_REPOSITORY_FILE": true,
+	"WALG_FILE_PREFIX": true, "WALG_GS_PREFIX": true, "WALG_AZ_PREFIX": true, "WALG_SSH_PREFIX": true,
+}
+
+func forbiddenExtraEnv(name string) bool { return forbiddenExtraEnvNames[name] }
 
 // readJobOutput pulls the last 20 lines of the Job's pod logs. Used to
 // surface a meaningful error message in the MetadataValid condition.

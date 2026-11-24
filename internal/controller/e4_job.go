@@ -29,7 +29,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
@@ -64,17 +63,7 @@ func shouldSpawnE4(br *aretev1alpha1.BackupRepository, lastE4 *metav1.Time, now 
 func (r *BackupRepositoryReconciler) listE4Jobs(
 	ctx context.Context, br *aretev1alpha1.BackupRepository,
 ) ([]batchv1.Job, error) {
-	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs,
-		client.InNamespace(br.Spec.S3.CredentialsSecret.Namespace),
-		client.MatchingLabels{
-			labelOwnerName: br.Name,
-			labelLevel:     labelLevelE4,
-		},
-	); err != nil {
-		return nil, err
-	}
-	return jobs.Items, nil
+	return r.listValidationJobs(ctx, br, labelLevelE4)
 }
 
 // e4JobName produces a deterministic name unique per (BR, time-bucket).
@@ -218,28 +207,49 @@ func (r *BackupRepositoryReconciler) spawnE4Job(
 func (r *BackupRepositoryReconciler) e4CommandArgsEnv(
 	br *aretev1alpha1.BackupRepository,
 ) (cmd, args []string, env []corev1.EnvVar, err error) {
-	baseEnv := append(credentialEnvVars(br.Spec), e2EnvFor(br.Spec)...)
+	baseEnv := validatorEnv(br.Spec)
+	script, err := e4Script(br.Spec.Format, e4WorkDir)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return []string{"sh", "-c"}, []string{script}, baseEnv, nil
+}
 
-	switch br.Spec.Format {
+// e4WorkDir is where the E4 Job's PersistentVolumeClaim is mounted.
+const e4WorkDir = "/work"
+
+// e4Script returns the shell script an E4 Job runs. workDir is a parameter
+// so tests can run the script outside a pod.
+//
+// The script's exit status must be the validator's. The tool's output goes
+// to a file and is tailed afterwards: piping it into tail made $? the exit
+// status of tail, which is always 0, so a failed retrieval was reported as
+// a successful one.
+func e4Script(format aretev1alpha1.BackupFormat, workDir string) (string, error) {
+	switch format {
 	case aretev1alpha1.BackupFormatWalg:
 		// Fetch the latest base into /work/extract; bytes = du of the
 		// extracted directory (decompressed PG data dir). Throughput
 		// includes the PVC write, which is what the user actually pays
 		// for in a real restore — that's the number worth trending.
-		script := "set -e; " +
-			"rm -rf /work/extract /work/.wal-g; " +
-			"mkdir -p /work/extract; " +
+		return "set -e; " +
+			"W='" + workDir + "'; " +
+			"rm -rf \"$W/extract\" \"$W/.wal-g\"; " +
+			"mkdir -p \"$W/extract\"; " +
 			"START=$(date +%s); " +
-			"wal-g backup-fetch /work/extract LATEST 2>&1 | tail -10; " +
-			"RC=$?; " +
+			"RC=0; wal-g backup-fetch \"$W/extract\" LATEST >\"$W/arete-e4.log\" 2>&1 || RC=$?; " +
+			"tail -10 \"$W/arete-e4.log\"; " +
 			"END=$(date +%s); " +
 			"DURATION=$((END - START)); " +
 			"[ $DURATION -lt 1 ] && DURATION=1; " +
-			"BYTES=$(du -sb /work/extract 2>/dev/null | awk '{print $1}'); " +
+			"BYTES=$(du -sb \"$W/extract\" 2>/dev/null | awk '{print $1}'); " +
 			"[ -z \"$BYTES\" ] && BYTES=0; " +
-			"echo \"STATS rc=$RC duration=$DURATION bytes=$BYTES objects=1 failed=0\"; " +
-			"exit $RC"
-		return []string{"sh", "-c"}, []string{script}, baseEnv, nil
+			// The restored data directory is decrypted tenant data. It has
+			// been measured; do not leave it on the volume.
+			"rm -rf \"$W/extract\"; " +
+			"FAILED=0; [ $RC -eq 0 ] || FAILED=1; " +
+			"echo \"STATS rc=$RC duration=$DURATION bytes=$BYTES objects=1 failed=$FAILED\"; " +
+			"exit $RC", nil
 
 	case aretev1alpha1.BackupFormatRestic:
 		// Bytes reported = actual bytes received over the network during
@@ -257,25 +267,26 @@ func (r *BackupRepositoryReconciler) e4CommandArgsEnv(
 		// treatment as E2/E3; E4 is on-demand and the operator can wait
 		// out a VolSync mover holding the lock. See jobActiveDeadline
 		// for the wall-clock upper bound.
-		script := "set -e; " +
-			"rm -rf /work/cache; " +
-			"mkdir -p /work/cache; " +
-			"export RESTIC_CACHE_DIR=/work/cache; " +
+		return "set -e; " +
+			"W='" + workDir + "'; " +
+			"rm -rf \"$W/cache\"; " +
+			"mkdir -p \"$W/cache\"; " +
+			"export RESTIC_CACHE_DIR=\"$W/cache\"; " +
 			"RX_BEFORE=$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0); " +
 			"START=$(date +%s); " +
-			"restic --retry-lock 15m check --read-data 2>&1 | tail -10; " +
-			"RC=$?; " +
+			"RC=0; restic --retry-lock 15m check --read-data >\"$W/arete-e4.log\" 2>&1 || RC=$?; " +
+			"tail -10 \"$W/arete-e4.log\"; " +
 			"END=$(date +%s); " +
 			"RX_AFTER=$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0); " +
 			"BYTES=$((RX_AFTER - RX_BEFORE)); " +
 			"[ $BYTES -lt 0 ] && BYTES=0; " +
 			"DURATION=$((END - START)); " +
 			"[ $DURATION -lt 1 ] && DURATION=1; " +
-			"echo \"STATS rc=$RC duration=$DURATION bytes=$BYTES objects=1 failed=0\"; " +
-			"exit $RC"
-		return []string{"sh", "-c"}, []string{script}, baseEnv, nil
+			"FAILED=0; [ $RC -eq 0 ] || FAILED=1; " +
+			"echo \"STATS rc=$RC duration=$DURATION bytes=$BYTES objects=1 failed=$FAILED\"; " +
+			"exit $RC", nil
 	}
-	return nil, nil, nil, fmt.Errorf("E4 not implemented for format %q", br.Spec.Format)
+	return "", fmt.Errorf("E4 not implemented for format %q", format)
 }
 
 // parseE4Stats extracts the FullRetrievalStatus from the validator's

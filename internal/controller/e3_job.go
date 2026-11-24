@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -32,7 +33,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	aretev1alpha1 "github.com/TobiasHofmaenner/arete/api/v1alpha1"
@@ -56,17 +56,7 @@ func shouldSpawnE3(br *aretev1alpha1.BackupRepository, lastE3 *metav1.Time, now 
 func (r *BackupRepositoryReconciler) listE3Jobs(
 	ctx context.Context, br *aretev1alpha1.BackupRepository,
 ) ([]batchv1.Job, error) {
-	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs,
-		client.InNamespace(br.Spec.S3.CredentialsSecret.Namespace),
-		client.MatchingLabels{
-			labelOwnerName: br.Name,
-			labelLevel:     labelLevelE3,
-		},
-	); err != nil {
-		return nil, err
-	}
-	return jobs.Items, nil
+	return r.listValidationJobs(ctx, br, labelLevelE3)
 }
 
 // e3JobName produces a deterministic name unique per (BR, time-bucket).
@@ -144,7 +134,13 @@ func (r *BackupRepositoryReconciler) spawnE3Job(
 func (r *BackupRepositoryReconciler) e3CommandArgsEnv(
 	ctx context.Context, br *aretev1alpha1.BackupRepository, creds S3Credentials,
 ) (cmd, args []string, env []corev1.EnvVar, err error) {
-	baseEnv := append(credentialEnvVars(br.Spec), e2EnvFor(br.Spec)...)
+	// The CRD requires the count whenever the interval is set, but an object
+	// stored before that rule existed may lack it. Refuse; do not dereference.
+	if br.Spec.SampledRetrievalObjects == nil {
+		return nil, nil, nil, errors.New(
+			"spec.sampledRetrievalObjects is required when sampledRetrievalInterval is set")
+	}
+	baseEnv := validatorEnv(br.Spec)
 	target := int(*br.Spec.SampledRetrievalObjects)
 
 	switch br.Spec.Format {
