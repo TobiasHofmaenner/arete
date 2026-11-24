@@ -95,7 +95,15 @@ type S3Source struct {
 	// validator binary needs that the producer also sets — e.g.
 	// WALG_COMPRESSION_METHOD=lzo when cnpg-plugin-wal-g writes lzo-
 	// compressed segments.
+	//
+	// Variables that would make the validator run a command, load code, or
+	// take its repository location or password from somewhere other than
+	// this spec are rejected. Names arete sets itself (the repository
+	// location, region, endpoint and the credentials) cannot be overridden
+	// here: arete's value wins.
 	// +optional
+	// +kubebuilder:validation:MaxProperties=32
+	// +kubebuilder:validation:XValidation:rule="self.all(k, !(k in ['PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'RESTIC_PASSWORD_COMMAND', 'RESTIC_PASSWORD_FILE', 'RESTIC_REPOSITORY_FILE', 'WALG_FILE_PREFIX', 'WALG_GS_PREFIX', 'WALG_AZ_PREFIX', 'WALG_SSH_PREFIX']))",message="extraEnv must not set PATH, LD_PRELOAD, LD_LIBRARY_PATH, RESTIC_PASSWORD_COMMAND, RESTIC_PASSWORD_FILE, RESTIC_REPOSITORY_FILE or a WALG_*_PREFIX for another storage"
 	ExtraEnv map[string]string `json:"extraEnv,omitempty"`
 
 	// requireObjectLock asserts that the bucket must have S3 Object Lock
@@ -152,6 +160,9 @@ type SecretReference struct {
 // strict contract (see ADR-023). E3 (sampled retrieval) and E4 (full
 // retrieval) are opt-in by interval presence: setting the interval enables
 // the level. There are no opt-out / pause / suspend / skip fields.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.sampledRetrievalInterval) || has(self.sampledRetrievalObjects)",message="sampledRetrievalObjects is required when sampledRetrievalInterval is set"
+// +kubebuilder:validation:XValidation:rule="!has(self.fullRetrievalInterval) || (has(self.fullRetrievalStorageClass) && has(self.fullRetrievalPVCSize))",message="fullRetrievalStorageClass and fullRetrievalPVCSize are required when fullRetrievalInterval is set"
 type BackupRepositorySpec struct {
 	// s3 is the location of the repository plus declared bucket security
 	// expectations.

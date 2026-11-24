@@ -340,7 +340,21 @@ spec:
                       validator binary needs that the producer also sets — e.g.
                       WALG_COMPRESSION_METHOD=lzo when cnpg-plugin-wal-g writes lzo-
                       compressed segments.
+
+                      Variables that would make the validator run a command, load code, or
+                      take its repository location or password from somewhere other than
+                      this spec are rejected. Names arete sets itself (the repository
+                      location, region, endpoint and the credentials) cannot be overridden
+                      here: arete's value wins.
+                    maxProperties: 32
                     type: object
+                    x-kubernetes-validations:
+                    - message: extraEnv must not set PATH, LD_PRELOAD, LD_LIBRARY_PATH,
+                        RESTIC_PASSWORD_COMMAND, RESTIC_PASSWORD_FILE, RESTIC_REPOSITORY_FILE
+                        or a WALG_*_PREFIX for another storage
+                      rule: self.all(k, !(k in ['PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+                        'RESTIC_PASSWORD_COMMAND', 'RESTIC_PASSWORD_FILE', 'RESTIC_REPOSITORY_FILE',
+                        'WALG_FILE_PREFIX', 'WALG_GS_PREFIX', 'WALG_AZ_PREFIX', 'WALG_SSH_PREFIX']))
                   prefix:
                     description: |-
                       prefix is the key prefix that scopes this repository within the bucket.
@@ -398,6 +412,14 @@ spec:
             - probeInterval
             - s3
             type: object
+            x-kubernetes-validations:
+            - message: sampledRetrievalObjects is required when sampledRetrievalInterval
+                is set
+              rule: '!has(self.sampledRetrievalInterval) || has(self.sampledRetrievalObjects)'
+            - message: fullRetrievalStorageClass and fullRetrievalPVCSize are required
+                when fullRetrievalInterval is set
+              rule: '!has(self.fullRetrievalInterval) || (has(self.fullRetrievalStorageClass)
+                && has(self.fullRetrievalPVCSize))'
           status:
             description: |-
               BackupRepositoryStatus defines the observed state of BackupRepository.
