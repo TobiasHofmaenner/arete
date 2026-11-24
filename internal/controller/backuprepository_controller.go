@@ -37,6 +37,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -1389,7 +1390,31 @@ func (r *BackupRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.mapSecretToRepositories),
 		).
 		Named("backuprepository").
+		WithOptions(repositoryControllerOptions()).
 		Complete(r)
+}
+
+// maxConcurrentRepositories is how many repositories are reconciled at the
+// same time. A reconcile includes the S3 probe, which takes from seconds to
+// minutes (a wal-g repository with 100,000 objects is listed in full), so a
+// single worker cannot keep up with a few dozen repositories.
+const maxConcurrentRepositories = 4
+
+// repositoryControllerOptions returns the queue and worker settings of the
+// BackupRepository controller.
+//
+// The queue is plain first-in-first-out. controller-runtime's default, a
+// priority queue, ranks the objects listed at start-up below every later
+// event and keeps that rank on each periodic requeue. Probing every
+// repository on schedule is the purpose of this controller. With the priority
+// queue and one worker, a few repositories with busy validation Jobs kept the
+// worker occupied after a restart while the others were never probed again,
+// their status frozen at its last value (seen: 21 of 27 repositories).
+func repositoryControllerOptions() controller.Options {
+	return controller.Options{
+		MaxConcurrentReconciles: maxConcurrentRepositories,
+		UsePriorityQueue:        new(false),
+	}
 }
 
 // forceRevalidatePredicate fires Reconcile when the

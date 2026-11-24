@@ -431,3 +431,17 @@ func TestE4Script_ExitStatusIsTheValidators(t *testing.T) {
 		}
 	}
 }
+
+// TestRepositoryControllerOptions pins two settings that decide whether every
+// repository is probed on schedule. With controller-runtime's default
+// priority queue and a single worker, repositories listed at start-up were
+// never probed again after a restart while a few busy ones kept the worker.
+func TestRepositoryControllerOptions(t *testing.T) {
+	o := repositoryControllerOptions()
+	if o.UsePriorityQueue == nil || *o.UsePriorityQueue {
+		t.Error("the repository queue must be first-in-first-out, not the priority queue")
+	}
+	if o.MaxConcurrentReconciles < 2 {
+		t.Errorf("MaxConcurrentReconciles = %d; one worker cannot keep up with slow probes", o.MaxConcurrentReconciles)
+	}
+}
