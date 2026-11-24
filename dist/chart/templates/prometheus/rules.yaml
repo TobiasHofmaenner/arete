@@ -28,6 +28,22 @@ spec:
           BR {{`{{ $labels.br }}`}} (format {{`{{ $labels.format }}`}}) has Health=False
           for over 1h. Inspect: kubectl describe br {{`{{ $labels.br }}`}}
 
+    # Unknown is not a resting state. It is correct while a first validation
+    # is pending or the store cannot be reached for a moment, but a
+    # repository whose state arete cannot determine for hours is not known
+    # to be safe. The alerts above and below only fire on False (0).
+    - alert: AreteBackupRepositoryStateUnknown
+      expr: arete_condition_state{condition="Healthy"} == -1
+      for: 2h
+      labels:
+        severity: warning
+      annotations:
+        summary: "arete cannot determine the state of BackupRepository {{`{{ $labels.br }}`}}"
+        description: |
+          BR {{`{{ $labels.br }}`}} (format {{`{{ $labels.format }}`}}) has had Health=Unknown
+          for over 2h: arete can neither confirm nor refute that its backups are
+          safe. Inspect: kubectl describe br {{`{{ $labels.br }}`}}
+
     # E1 reachability. False here means we can't even talk to S3.
     - alert: AreteRepositoryUnreachable
       expr: arete_condition_state{condition="Reachable"} == 0

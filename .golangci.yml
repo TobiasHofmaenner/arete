@@ -45,6 +45,10 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # Tests repeat literals on purpose: each case should read on its own.
+      - linters:
+          - goconst
+        path: _test\.go
     paths:
       - third_party$
       - builtin$

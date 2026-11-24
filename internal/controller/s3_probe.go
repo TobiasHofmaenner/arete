@@ -78,6 +78,13 @@ type probeResult struct {
 	LastSuccessfulBackup *metav1.Time
 	LatestBackup         *aretev1alpha1.LatestBackupStatus // wal-g only at E1; nil for restic
 
+	// BackupStateErr is non-nil when the probe reached the store but could
+	// not determine whether a backup exists: the listing failed, the format's
+	// marker file could not be read or parsed, or the format is not
+	// implemented. It must never be confused with an empty repository.
+	// LastSuccessfulBackup == nil means "no backup" only when this is nil.
+	BackupStateErr error
+
 	// Inventory is the result of the recursive LIST run alongside the
 	// E1 reachability check. nil if reachability failed (no point
 	// scanning a prefix we couldn't reach).
@@ -121,16 +128,19 @@ func probeRepository(
 	// Phase 3: format-aware sentinel parse. wal-g returns full latestBackup
 	// (sentinel is plaintext); restic returns only the timestamp (everything
 	// else needs decryption — that's E2's job).
-	format, version, lastSuccess, latest := detectFormatAndTimestamp(ctx, client, spec)
+	format, version, lastSuccess, latest, stateErr := detectFormatAndTimestamp(ctx, client, spec)
 	result.DetectedFormat = format
 	result.DetectedVersion = version
 	result.LastSuccessfulBackup = lastSuccess
 	result.LatestBackup = latest
+	result.BackupStateErr = stateErr
 
 	// Phase 4: inventory. Best-effort; if it fails we leave the field
 	// nil and the controller preserves the previous status.
 	if inv, err := runInventoryProbe(ctx, client, spec); err == nil {
 		result.Inventory = inv
+	} else {
+		logf.FromContext(ctx).Error(err, "inventory listing failed; keeping the previous inventory")
 	}
 
 	return result
@@ -246,34 +256,72 @@ func checkBucketSecurity(
 			"endpoint must use https://"
 	}
 
+	checked, ok, reason, msg := checkDeclaredBucketSettings(ctx, client, spec)
+	if !ok {
+		return false, reason, msg
+	}
+
+	msg = "https endpoint"
+	if len(checked) > 0 {
+		msg = fmt.Sprintf("https endpoint, verified: %s", strings.Join(checked, ", "))
+	}
+	return true, aretev1alpha1.ReasonProbeSucceeded, msg
+}
+
+// S3 error codes a backend returns when the setting simply is not configured.
+// Any other error means the question could not be answered (no permission,
+// backend unreachable) and must not be reported as "missing".
+const (
+	s3CodeObjectLockNotConfigured = "ObjectLockConfigurationNotFoundError"
+	s3CodeEncryptionNotConfigured = "ServerSideEncryptionConfigurationNotFoundError"
+)
+
+// checkDeclaredBucketSettings verifies the bucket settings the spec declares
+// as required. It returns the names of the settings it verified. On failure
+// the reason says whether the setting is absent (ObjectLockMissing,
+// BucketEncryptionMissing) or whether arete could not find out (the
+// classifyS3Error reasons, e.g. CredentialsRejected when the credentials
+// lack permission to read the bucket's configuration).
+func checkDeclaredBucketSettings(
+	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
+) (checked []string, ok bool, reason, message string) {
 	checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	var checked []string
-
 	if spec.S3.RequireObjectLock {
-		_, _, _, _, err := client.GetObjectLockConfig(checkCtx, spec.S3.Bucket)
-		if err != nil {
-			return false, aretev1alpha1.ReasonObjectLockMissing,
-				fmt.Sprintf("requireObjectLock=true but bucket reports: %s", err.Error())
+		if _, _, _, _, err := client.GetObjectLockConfig(checkCtx, spec.S3.Bucket); err != nil {
+			if s3ErrorCode(err) == s3CodeObjectLockNotConfigured {
+				return checked, false, aretev1alpha1.ReasonObjectLockMissing,
+					"requireObjectLock=true but the bucket has no Object Lock configuration"
+			}
+			r, m := classifyS3Error(err)
+			return checked, false, r, "could not read the bucket's Object Lock configuration: " + m
 		}
 		checked = append(checked, "object-lock")
 	}
 
 	if spec.S3.RequireBucketEncryption {
-		_, err := client.GetBucketEncryption(checkCtx, spec.S3.Bucket)
-		if err != nil {
-			return false, aretev1alpha1.ReasonBucketEncryptionMissing,
-				fmt.Sprintf("requireBucketEncryption=true but bucket reports: %s", err.Error())
+		if _, err := client.GetBucketEncryption(checkCtx, spec.S3.Bucket); err != nil {
+			if s3ErrorCode(err) == s3CodeEncryptionNotConfigured {
+				return checked, false, aretev1alpha1.ReasonBucketEncryptionMissing,
+					"requireBucketEncryption=true but the bucket has no encryption configuration"
+			}
+			r, m := classifyS3Error(err)
+			return checked, false, r, "could not read the bucket's encryption configuration: " + m
 		}
 		checked = append(checked, "bucket-encryption")
 	}
 
-	msg := "https endpoint"
-	if len(checked) > 0 {
-		msg = fmt.Sprintf("https endpoint, verified: %s", strings.Join(checked, ", "))
+	return checked, true, "", ""
+}
+
+// s3ErrorCode returns the S3 error code of err, or "" if err is not an S3
+// error response.
+func s3ErrorCode(err error) string {
+	if resp, ok := errors.AsType[minio.ErrorResponse](err); ok {
+		return resp.Code
 	}
-	return true, aretev1alpha1.ReasonProbeSucceeded, msg
+	return ""
 }
 
 // classifyS3Error turns a raw minio-go error into a (reason, message) pair
@@ -304,23 +352,34 @@ func classifyS3Error(err error) (string, string) {
 //   - wal-g: E1 owns it (sentinel is plaintext)
 //   - restic: E2 owns it (E1 can only see encrypted file timestamps)
 //   - barman: deferred
+//
+// The returned error is non-nil when the lookup could not be completed. A nil
+// timestamp with a nil error means the store answered and holds no backup.
 func detectFormatAndTimestamp(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
-) (format string, version string, lastSuccess *metav1.Time, latest *aretev1alpha1.LatestBackupStatus) {
+) (
+	format string, version string,
+	lastSuccess *metav1.Time, latest *aretev1alpha1.LatestBackupStatus, err error,
+) {
 	switch spec.Format {
 	case aretev1alpha1.BackupFormatWalg:
-		v, t, l := readWalgSentinel(ctx, client, spec)
-		return "walg", v, t, l
+		v, t, l, err := readWalgSentinel(ctx, client, spec)
+		return "walg", v, t, l, err
 	case aretev1alpha1.BackupFormatRestic:
 		// detectedVersion stays empty for restic at E1 — restic encrypts
 		// the config file, so version determination requires E2.
 		// LatestBackup nil here; E2 populates it from `restic snapshots`.
-		return "restic", "", readResticLatestSnapshotTime(ctx, client, spec), nil
+		t, err := readResticLatestSnapshotTime(ctx, client, spec)
+		return "restic", "", t, nil, err
 	case aretev1alpha1.BackupFormatBarman:
-		return "barman", "", nil, nil
+		return "barman", "", nil, nil, errFormatNotImplemented
 	}
-	return "", "", nil, nil
+	return "", "", nil, nil, errFormatNotImplemented
 }
+
+// errFormatNotImplemented marks a format the API accepts but arete cannot
+// read yet. Reported as Unknown, never as an empty repository.
+var errFormatNotImplemented = errors.New("backup format is not implemented")
 
 // --- wal-g ---
 
@@ -352,10 +411,13 @@ type walgSentinel struct {
 //   - claimedLastSuccessfulBackup timestamp (load-bearing for BackupCurrent)
 //   - full claimedLatestBackup struct (name from filename, size + time
 //     from sentinel JSON)
+//
+// No sentinel at all is not an error: it returns nil values and a nil error
+// (the repository holds no completed base backup). A listing that fails, or a
+// sentinel that cannot be fetched or parsed, returns an error.
 func readWalgSentinel(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
-) (string, *metav1.Time, *aretev1alpha1.LatestBackupStatus) {
-	log := logf.FromContext(ctx)
+) (string, *metav1.Time, *aretev1alpha1.LatestBackupStatus, error) {
 	const suffix = "_backup_stop_sentinel.json"
 
 	// wal-g writes one sentinel per basebackup at the top of
@@ -373,15 +435,14 @@ func readWalgSentinel(
 		Recursive: false,
 	}) {
 		if obj.Err != nil {
-			log.Error(obj.Err, "walg sentinel hunt list error")
-			return "", nil, nil
+			return "", nil, nil, fmt.Errorf("list %s: %w", listPrefix, obj.Err)
 		}
 		if strings.HasSuffix(obj.Key, suffix) {
 			sentinels = append(sentinels, obj)
 		}
 	}
 	if len(sentinels) == 0 {
-		return "", nil, nil
+		return "", nil, nil, nil
 	}
 	// Pick the most recent sentinel.
 	sort.Slice(sentinels, func(i, j int) bool {
@@ -391,13 +452,11 @@ func readWalgSentinel(
 
 	body, err := getObjectBody(ctx, client, spec.S3.Bucket, latestKey)
 	if err != nil {
-		log.Error(err, "walg sentinel GET failed", "key", latestKey)
-		return "", nil, nil
+		return "", nil, nil, fmt.Errorf("read sentinel %s: %w", latestKey, err)
 	}
 	var s walgSentinel
 	if err := json.Unmarshal(body, &s); err != nil {
-		log.Error(err, "walg sentinel JSON parse failed", "key", latestKey)
-		return "", nil, nil
+		return "", nil, nil, fmt.Errorf("parse sentinel %s: %w", latestKey, err)
 	}
 
 	version := fmt.Sprintf("sentinel-v%d/pg-%s", s.Version, formatPgVersion(s.PgVersion))
@@ -418,7 +477,7 @@ func readWalgSentinel(
 		uq := resource.NewQuantity(s.UncompressedSize, resource.BinarySI)
 		latest.UncompressedSizeBytes = uq
 	}
-	return version, &ts, latest
+	return version, &ts, latest, nil
 }
 
 // parseWalgTime parses wal-g's time format (RFC3339-ish with microseconds)
@@ -464,11 +523,12 @@ func formatPgVersion(v int) string {
 //
 // Snapshot file LastModified is reliable — restic creates one file per
 // snapshot and never rewrites them.
+//
+// An empty snapshots/ directory returns (nil, nil). A listing that fails
+// returns an error, so "could not list" is never mistaken for "no snapshots".
 func readResticLatestSnapshotTime(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
-) *metav1.Time {
-	log := logf.FromContext(ctx)
-
+) (*metav1.Time, error) {
 	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -479,8 +539,7 @@ func readResticLatestSnapshotTime(
 		Recursive: false,
 	}) {
 		if obj.Err != nil {
-			log.Error(obj.Err, "restic snapshots list error")
-			return nil
+			return nil, fmt.Errorf("list %s/snapshots/: %w", spec.S3.Prefix, obj.Err)
 		}
 		count++
 		if obj.LastModified.After(newest) {
@@ -488,10 +547,10 @@ func readResticLatestSnapshotTime(
 		}
 	}
 	if count == 0 {
-		return nil
+		return nil, nil
 	}
 	t := metav1.NewTime(newest)
-	return &t
+	return &t, nil
 }
 
 // getObjectBody reads an S3 object fully into memory. Only used for tiny

@@ -110,8 +110,12 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	var br aretev1alpha1.BackupRepository
 	if err := r.Get(ctx, req.NamespacedName, &br); err != nil {
-		// BR deleted: drop any in-memory state for it.
-		r.credsTransient.Delete(req.NamespacedName)
+		if apierrors.IsNotFound(err) {
+			// BR deleted: drop in-memory state and its metric series, so a
+			// deleted repository does not keep reporting its last values.
+			r.credsTransient.Delete(req.NamespacedName)
+			aretemetrics.DeleteRepository(req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -359,6 +363,10 @@ func publishMetrics(br *aretev1alpha1.BackupRepository) {
 	if br.Status.ClaimedLastSuccessfulBackup != nil {
 		age := time.Since(br.Status.ClaimedLastSuccessfulBackup.Time).Seconds()
 		aretemetrics.BackupAgeSeconds.WithLabelValues(br.Name, format).Set(age)
+	} else {
+		// No backup known: remove the series instead of leaving the last
+		// age frozen, which would look like a backup that stopped ageing.
+		aretemetrics.BackupAgeSeconds.DeleteLabelValues(br.Name, format)
 	}
 
 	if e4 := br.Status.LastFullRetrieval; e4 != nil {
@@ -385,6 +393,28 @@ func publishMetrics(br *aretev1alpha1.BackupRepository) {
 		}
 		aretemetrics.ConditionState.WithLabelValues(br.Name, format, c.Type).Set(v)
 	}
+	// Conditions that were removed from status (a level was disabled, the
+	// size budget was unset) must not keep their last value as a series.
+	for _, t := range allConditionTypes {
+		if apimeta.FindStatusCondition(br.Status.Conditions, t) == nil {
+			aretemetrics.ConditionState.DeleteLabelValues(br.Name, format, t)
+		}
+	}
+}
+
+// allConditionTypes lists every condition type arete can set on a
+// BackupRepository. Keep in step with the Condition* constants.
+var allConditionTypes = []string{
+	aretev1alpha1.ConditionReachable,
+	aretev1alpha1.ConditionBackupCurrent,
+	aretev1alpha1.ConditionBucketSecurityValid,
+	aretev1alpha1.ConditionSizeWithinBudget,
+	aretev1alpha1.ConditionProbeHealthy,
+	aretev1alpha1.ConditionMetadataValid,
+	aretev1alpha1.ConditionSampledIntegrityValid,
+	aretev1alpha1.ConditionFullRetrievalCompleted,
+	aretev1alpha1.ConditionValidationHealthy,
+	aretev1alpha1.ConditionHealthy,
 }
 
 // recordValidationRun bumps the run counter + duration histogram for a
@@ -814,22 +844,7 @@ func (r *BackupRepositoryReconciler) applyStatus(
 	if honoredForceE4At != nil {
 		br.Status.LastForcedE4At = honoredForceE4At
 	}
-	br.Status.DetectedFormat = p.DetectedFormat
-	br.Status.DetectedVersion = p.DetectedVersion
-	br.Status.ClaimedLastSuccessfulBackup = p.LastSuccessfulBackup
-
-	// Per-format ownership of claimedLatestBackup:
-	//   - wal-g: E1 owns it (sentinels are plaintext). probe.LatestBackup
-	//     is non-nil for wal-g — write through every cycle.
-	//   - restic: E2 owns it. probe.LatestBackup is nil for restic; E2's
-	//     Job result populates it. Keep stale value on cycles without a
-	//     new E2 result so the dashboard doesn't blink to nil.
-	if p.LatestBackup != nil {
-		br.Status.ClaimedLatestBackup = p.LatestBackup
-	}
-	if p.Inventory != nil {
-		br.Status.ObservedInventory = p.Inventory
-	}
+	applyProbeToStatus(&br.Status, p)
 
 	// Ingest any newly-completed E2 result into status.
 	var metadataValid *metav1.Condition
@@ -908,7 +923,7 @@ func (r *BackupRepositoryReconciler) applyStatus(
 		reachable: condFromBool(p.Reachable, p.ReachableReason, p.ReachableMessage),
 		bucketSecurityValid: ifReachable(p.Reachable,
 			condFromBool(p.BucketSecurityValid, p.BucketSecurityReason, p.BucketSecurityMessage)),
-		backupCurrent:          ifReachable(p.Reachable, computeBackupCurrent(br, now.Time)),
+		backupCurrent:          backupCurrentCondition(br, p, now.Time),
 		metadataValid:          metadataValid,
 		e2JobActive:            e2.jobActive,
 		sampledIntegrityValid:  sampledIntegrityValid,
@@ -1070,6 +1085,63 @@ func (r *BackupRepositoryReconciler) applyConditions(
 		aretev1alpha1.ConditionValidationHealthy,
 	)
 	setCondition(cs, aretev1alpha1.ConditionHealthy, &overall)
+
+	// Every condition is recomputed each cycle, so all of them describe the
+	// generation being reconciled (API conventions: conditions carry
+	// observedGeneration so a reader can tell a stale condition from a
+	// current one after a spec change).
+	for i := range *cs {
+		(*cs)[i].ObservedGeneration = br.Generation
+	}
+}
+
+// applyProbeToStatus copies what the E1 probe learned into status.
+//
+// The fields that describe the repository's backup state are overwritten
+// only when the probe actually determined that state: the store was
+// reachable and the format lookup completed. Otherwise the last known
+// values stay, so "could not find out" never erases what was known and
+// never reads as "there is no backup". When the lookup did complete, a nil
+// timestamp is written through: the repository really is empty.
+func applyProbeToStatus(st *aretev1alpha1.BackupRepositoryStatus, p probeResult) {
+	if p.Reachable && p.BackupStateErr == nil {
+		st.DetectedFormat = p.DetectedFormat
+		st.DetectedVersion = p.DetectedVersion
+		st.ClaimedLastSuccessfulBackup = p.LastSuccessfulBackup
+
+		// Per-format ownership of claimedLatestBackup:
+		//   - wal-g: E1 owns it (sentinels are plaintext) and writes it
+		//     every cycle, including nil when no sentinel exists.
+		//   - restic: E2 owns it. The probe has nothing to say, so the
+		//     value from the last E2 run stays.
+		if p.LatestBackup != nil || p.DetectedFormat == string(aretev1alpha1.BackupFormatWalg) {
+			st.ClaimedLatestBackup = p.LatestBackup
+		}
+	}
+	if p.Inventory != nil {
+		st.ObservedInventory = p.Inventory
+	}
+}
+
+// backupCurrentCondition derives BackupCurrent from the probe. It is
+// Unknown whenever arete could not determine the backup state (store
+// unreachable, lookup failed, format not implemented). True and False are
+// reserved for an answer the store actually gave. Call after
+// applyProbeToStatus, since the lag check reads status.
+func backupCurrentCondition(
+	br *aretev1alpha1.BackupRepository, p probeResult, now time.Time,
+) *metav1.Condition {
+	switch {
+	case !p.Reachable:
+		return condUnknown(aretev1alpha1.ReasonS3Unreachable, "skipped: phase-1 reachability failed")
+	case errors.Is(p.BackupStateErr, errFormatNotImplemented):
+		return condUnknown(aretev1alpha1.ReasonFormatNotImplemented,
+			fmt.Sprintf("format %q is not implemented; arete cannot tell whether a backup exists", br.Spec.Format))
+	case p.BackupStateErr != nil:
+		return condUnknown(aretev1alpha1.ReasonBackupStateUnreadable,
+			"could not determine the latest backup: "+p.BackupStateErr.Error())
+	}
+	return computeBackupCurrent(br, now)
 }
 
 // computeSizeWithinBudget returns SizeWithinBudget True/False/Unknown:
