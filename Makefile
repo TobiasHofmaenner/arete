@@ -187,8 +187,9 @@ ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 
 ## Tool Versions
+# 5.8.3 needs Go 1.27; raise together with the Go version in go.mod.
 # renovate: datasource=go depName=sigs.k8s.io/kustomize/kustomize/v5
-KUSTOMIZE_VERSION ?= v5.8.3
+KUSTOMIZE_VERSION ?= v5.8.2
 # Follows the Kubernetes library minor in go.mod (0.20 pairs with 0.35).
 # renovate: datasource=go depName=sigs.k8s.io/controller-tools
 CONTROLLER_TOOLS_VERSION ?= v0.20.1
