@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -173,8 +174,17 @@ func main() {
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "93fbb8c5.arete.io",
+		// Secrets are read from the API server when a reconcile needs one,
+		// never from a cache. Together with the metadata-only Secret watch
+		// this keeps Secret contents out of the manager's memory, apart from
+		// the credentials of the repository being probed.
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{&corev1.Secret{}},
+			},
+		},
+		LeaderElection:   enableLeaderElection,
+		LeaderElectionID: "93fbb8c5.arete.io",
 		// The defaults (15s lease, 10s renew deadline) make the manager exit
 		// whenever the API server answers slowly for ten seconds. On a busy
 		// control plane that happened regularly (55 restarts in ten weeks on
