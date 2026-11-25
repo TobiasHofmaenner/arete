@@ -57,6 +57,10 @@ type fakeS3 struct {
 	objectLock string
 	encryption string
 
+	// recursiveLists counts listings without a delimiter: the full walks of
+	// a prefix that the inventory makes.
+	recursiveLists int
+
 	srv *httptest.Server
 }
 
@@ -204,6 +208,9 @@ func (f *fakeS3) serveList(w http.ResponseWriter, prefix, delimiter string) {
 	if code, ok := f.listErr[prefix]; ok {
 		writeS3Error(w, code)
 		return
+	}
+	if delimiter == "" {
+		f.recursiveLists++
 	}
 	keys := make([]string, 0, len(f.objects))
 	for k := range f.objects {
