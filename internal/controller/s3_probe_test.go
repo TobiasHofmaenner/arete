@@ -195,7 +195,7 @@ func TestProbeRepository(t *testing.T) {
 		f.put(testPrefix+"/data/00/pack", "0123456789", t1)
 
 		p := probeRepository(context.Background(),
-			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"})
+			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"}, true)
 		if !p.Reachable {
 			t.Fatalf("expected reachable, got %s: %s", p.ReachableReason, p.ReachableMessage)
 		}
@@ -216,7 +216,7 @@ func TestProbeRepository(t *testing.T) {
 	t.Run("empty prefix is reachable and has no backup", func(t *testing.T) {
 		f := newFakeS3(t)
 		p := probeRepository(context.Background(),
-			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"})
+			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"}, true)
 		if !p.Reachable || p.BackupStateErr != nil || p.LastSuccessfulBackup != nil {
 			t.Fatalf("reachable=%v err=%v last=%v", p.Reachable, p.BackupStateErr, p.LastSuccessfulBackup)
 		}
@@ -231,7 +231,7 @@ func TestProbeRepository(t *testing.T) {
 		f.listErr[testPrefix+"/snapshots/"] = "AccessDenied"
 
 		p := probeRepository(context.Background(),
-			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"})
+			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"}, true)
 		if !p.Reachable {
 			t.Fatalf("expected reachable, got %s", p.ReachableReason)
 		}
@@ -247,7 +247,7 @@ func TestProbeRepository(t *testing.T) {
 		f := newFakeS3(t)
 		f.bucketErr = "NoSuchBucket"
 		p := probeRepository(context.Background(),
-			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"})
+			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"}, true)
 		if p.Reachable || p.ReachableReason != aretev1alpha1.ReasonBucketNotFound {
 			t.Fatalf("reachable=%v reason=%s", p.Reachable, p.ReachableReason)
 		}
@@ -257,7 +257,7 @@ func TestProbeRepository(t *testing.T) {
 		f := newFakeS3(t)
 		f.listErr[testPrefix+"/"] = "AccessDenied"
 		p := probeRepository(context.Background(),
-			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"})
+			f.spec(testPrefix, aretev1alpha1.BackupFormatRestic), S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"}, true)
 		if p.Reachable || p.ReachableReason != aretev1alpha1.ReasonCredentialsRejected {
 			t.Fatalf("reachable=%v reason=%s", p.Reachable, p.ReachableReason)
 		}
@@ -369,5 +369,33 @@ func TestBuildS3Client_RejectsBadEndpoints(t *testing.T) {
 		if _, err := buildS3Client(aretev1alpha1.S3Source{Endpoint: endpoint, Region: "x"}, S3Credentials{}); err == nil {
 			t.Errorf("endpoint %q: expected an error", endpoint)
 		}
+	}
+}
+
+func TestProbeRepository_InventoryOnlyWhenRequested(t *testing.T) {
+	f := newFakeS3(t)
+	f.put(testPrefix+"/config", "cfg", t0)
+	f.put(testPrefix+"/snapshots/aaa", "snap", t1)
+	spec := f.spec(testPrefix, aretev1alpha1.BackupFormatRestic)
+	creds := S3Credentials{AccessKeyID: "k", SecretAccessKey: "s"}
+
+	p := probeRepository(context.Background(), spec, creds, false)
+	if !p.Reachable || p.LastSuccessfulBackup == nil {
+		t.Fatalf("a probe without inventory must still find the backup: reachable=%v last=%v",
+			p.Reachable, p.LastSuccessfulBackup)
+	}
+	if p.Inventory != nil {
+		t.Errorf("inventory was produced although not requested: %+v", p.Inventory)
+	}
+	if f.recursiveLists != 0 {
+		t.Errorf("a probe without inventory walked the whole prefix %d time(s)", f.recursiveLists)
+	}
+
+	p = probeRepository(context.Background(), spec, creds, true)
+	if p.Inventory == nil || p.Inventory.ObjectCount != 2 {
+		t.Errorf("inventory = %+v, want 2 objects", p.Inventory)
+	}
+	if f.recursiveLists != 1 {
+		t.Errorf("expected exactly one full walk, got %d", f.recursiveLists)
 	}
 }

@@ -95,6 +95,56 @@ type BackupRepositoryReconciler struct {
 	// which is acceptable — restart already triggers a full re-reconcile
 	// of every BR. Keyed by NamespacedName, value is time.Time.
 	credsTransient sync.Map
+
+	// inventories records, per BR name, when the full inventory listing was
+	// last attempted (value: inventoryRecord). In memory only: after a
+	// restart every repository is listed once on its first probe.
+	inventories sync.Map
+}
+
+// inventoryRecord is the outcome of the last inventory attempt for a BR.
+type inventoryRecord struct {
+	at         time.Time
+	ok         bool
+	generation int64
+}
+
+// inventoryRetryInterval is how long arete waits before listing again after
+// a failed inventory, unless the regular interval is shorter.
+const inventoryRetryInterval = time.Hour
+
+// inventoryDue reports whether this reconcile should include the full
+// inventory listing of the repository.
+//
+// The listing is the expensive part of a probe, and nothing that decides
+// reachability or backup freshness depends on it. Running it on every probe
+// (every ten minutes, and again on every validation-Job event) kept the
+// store busy listing, to the point where listings timed out and one
+// reconcile worker could not keep up with 27 repositories. It runs:
+//   - on the first probe after a start or after the spec changed (a new
+//     location must not keep the old location's numbers),
+//   - then once per metadataValidationInterval,
+//   - and after a failure, again after inventoryRetryInterval.
+func (r *BackupRepositoryReconciler) inventoryDue(br *aretev1alpha1.BackupRepository, now time.Time) bool {
+	v, ok := r.inventories.Load(br.Name)
+	if !ok {
+		return true
+	}
+	rec := v.(inventoryRecord)
+	if rec.generation != br.Generation {
+		return true
+	}
+	interval := br.Spec.MetadataValidationInterval.Duration
+	if !rec.ok && inventoryRetryInterval < interval {
+		interval = inventoryRetryInterval
+	}
+	return now.Sub(rec.at) >= interval
+}
+
+// recordInventory notes that an inventory listing was attempted at the
+// given time and whether it succeeded.
+func (r *BackupRepositoryReconciler) recordInventory(br *aretev1alpha1.BackupRepository, at time.Time, ok bool) {
+	r.inventories.Store(br.Name, inventoryRecord{at: at, ok: ok, generation: br.Generation})
 }
 
 // +kubebuilder:rbac:groups=arete.arete.io,resources=backuprepositories,verbs=get;list;watch;create;update;patch;delete
@@ -115,6 +165,7 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			// BR deleted: drop in-memory state and its metric series, so a
 			// deleted repository does not keep reporting its last values.
 			r.credsTransient.Delete(req.NamespacedName)
+			r.inventories.Delete(req.Name)
 			aretemetrics.DeleteRepository(req.Name)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -181,8 +232,14 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		e4ForceNeeded = !alreadyPostForce
 	}
 
-	// E1 probe (in-process; cheap)
-	probe := probeRepository(ctx, br.Spec, creds)
+	// E1 probe (in-process). The full inventory listing runs on its own
+	// schedule, see inventoryDue.
+	now := time.Now()
+	withInventory := r.inventoryDue(&br, now)
+	probe := probeRepository(ctx, br.Spec, creds, withInventory)
+	if withInventory && probe.Reachable {
+		r.recordInventory(&br, now, probe.Inventory != nil)
+	}
 
 	// Validation Jobs (E2 to E4). Two rules:
 	//

@@ -445,3 +445,48 @@ func TestRepositoryControllerOptions(t *testing.T) {
 		t.Errorf("MaxConcurrentReconciles = %d; one worker cannot keep up with slow probes", o.MaxConcurrentReconciles)
 	}
 }
+
+func TestInventoryDue(t *testing.T) {
+	now := time.Now()
+	br := jobTestRepository() // metadataValidationInterval 6h
+	br.Generation = 3
+	r := &BackupRepositoryReconciler{}
+
+	if !r.inventoryDue(br, now) {
+		t.Fatal("first probe after a start must take the inventory")
+	}
+
+	r.recordInventory(br, now.Add(-10*time.Minute), true)
+	if r.inventoryDue(br, now) {
+		t.Error("ten minutes after a successful inventory it must not run again")
+	}
+
+	r.recordInventory(br, now.Add(-7*time.Hour), true)
+	if !r.inventoryDue(br, now) {
+		t.Error("after metadataValidationInterval the inventory is due again")
+	}
+
+	// A failed listing is retried, but not on every probe.
+	r.recordInventory(br, now.Add(-10*time.Minute), false)
+	if r.inventoryDue(br, now) {
+		t.Error("a failed inventory must not be retried ten minutes later")
+	}
+	r.recordInventory(br, now.Add(-61*time.Minute), false)
+	if !r.inventoryDue(br, now) {
+		t.Error("a failed inventory is due again after the retry interval")
+	}
+
+	// A changed spec may mean a new location: its numbers must be fresh.
+	r.recordInventory(br, now.Add(-time.Minute), true)
+	br.Generation = 4
+	if !r.inventoryDue(br, now) {
+		t.Error("a spec change must make the inventory due")
+	}
+
+	// Another repository is unaffected.
+	other := jobTestRepository()
+	other.Name = "other"
+	if !r.inventoryDue(other, now) {
+		t.Error("each repository has its own schedule")
+	}
+}

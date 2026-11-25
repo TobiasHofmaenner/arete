@@ -95,8 +95,13 @@ type probeResult struct {
 // Kubernetes side effects. The returned probeResult captures every E1 sub-
 // signal the controller needs to set conditions; downstream computations
 // (BackupCurrent, ProbeHealthy rollup) live in the controller.
+//
+// withInventory adds the full recursive listing of the prefix. It is by far
+// the most expensive part (a wal-g repository with 100,000 objects is over
+// a hundred LIST calls) and is not needed to decide reachability or backup
+// freshness, so the caller requests it on its own, slower schedule.
 func probeRepository(
-	ctx context.Context, spec aretev1alpha1.BackupRepositorySpec, creds S3Credentials,
+	ctx context.Context, spec aretev1alpha1.BackupRepositorySpec, creds S3Credentials, withInventory bool,
 ) probeResult {
 	client, err := buildS3Client(spec.S3, creds)
 	if err != nil {
@@ -135,25 +140,27 @@ func probeRepository(
 	result.LatestBackup = latest
 	result.BackupStateErr = stateErr
 
-	// Phase 4: inventory. Best-effort; if it fails we leave the field
-	// nil and the controller preserves the previous status.
-	if inv, err := runInventoryProbe(ctx, client, spec); err == nil {
-		result.Inventory = inv
-	} else {
-		logf.FromContext(ctx).Error(err, "inventory listing failed; keeping the previous inventory")
+	// Phase 4: inventory, only when requested. Best-effort; if it fails we
+	// leave the field nil and the controller preserves the previous status.
+	if withInventory {
+		if inv, err := runInventoryProbe(ctx, client, spec); err == nil {
+			result.Inventory = inv
+		} else {
+			logf.FromContext(ctx).Error(err, "inventory listing failed; keeping the previous inventory")
+		}
 	}
 
 	return result
 }
 
 // runInventoryProbe walks the full prefix recursively to compute object
-// count, total bytes, and oldest/newest LastModified. Bounded by a
-// generous timeout — for repos with millions of objects this would need
-// to be paginated/sharded, but our largest current repos are <50k.
+// count, total bytes, and oldest/newest LastModified. Bounded by
+// inventoryTimeout — for repos with millions of objects this would need
+// to be paginated/sharded; the largest seen so far hold about 125,000.
 func runInventoryProbe(
 	ctx context.Context, client *minio.Client, spec aretev1alpha1.BackupRepositorySpec,
 ) (*aretev1alpha1.InventoryStatus, error) {
-	listCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	listCtx, cancel := context.WithTimeout(ctx, inventoryTimeout)
 	defer cancel()
 
 	var (
@@ -193,6 +200,11 @@ func runInventoryProbe(
 	}
 	return out, nil
 }
+
+// inventoryTimeout bounds one full listing. Two minutes was too little for
+// a repository with 100,000 objects once the store was busy; the listing now
+// runs a few times a day instead of on every probe, so it can take longer.
+const inventoryTimeout = 10 * time.Minute
 
 func buildS3Client(src aretev1alpha1.S3Source, creds S3Credentials) (*minio.Client, error) {
 	u, err := url.Parse(src.Endpoint)
