@@ -20,13 +20,4 @@ resources:
   kind: BackupRepository
   path: github.com/TobiasHofmaenner/arete/api/v1alpha1
   version: v1alpha1
-- api:
-    crdVersion: v1
-    namespaced: true
-  controller: true
-  domain: arete.io
-  group: arete
-  kind: ConditionalConfig
-  path: github.com/TobiasHofmaenner/arete/api/v1alpha1
-  version: v1alpha1
 version: "3"

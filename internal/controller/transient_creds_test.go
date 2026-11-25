@@ -409,28 +409,6 @@ func TestPreservedCondition_AbsentIsNil(t *testing.T) {
 	}
 }
 
-func TestIsHealthyUnknown(t *testing.T) {
-	cases := []struct {
-		name string
-		cs   []metav1.Condition
-		want bool
-	}{
-		{"absent", nil, false},
-		{"true", []metav1.Condition{{Type: aretev1alpha1.ConditionHealthy, Status: metav1.ConditionTrue}}, false},
-		{"false", []metav1.Condition{{Type: aretev1alpha1.ConditionHealthy, Status: metav1.ConditionFalse}}, false},
-		{"unknown", []metav1.Condition{{Type: aretev1alpha1.ConditionHealthy, Status: metav1.ConditionUnknown}}, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			br := &aretev1alpha1.BackupRepository{}
-			br.Status.Conditions = tc.cs
-			if got := isHealthyUnknown(br); got != tc.want {
-				t.Errorf("got %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestForceRevalidatePredicate_OnlyAnnotationDelta(t *testing.T) {
 	// The predicate must distinguish "annotation changed" from "any
 	// other metadata change" so we don't get spammed by label edits.

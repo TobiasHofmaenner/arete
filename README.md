@@ -11,7 +11,7 @@ Greek ἀρετή — *excellence at fulfilling one's purpose*. A backup's *aret
 Alpha, but functionally complete. As of v0.5.x:
 
 - E1–E4 validation all shipped and running in production against real wal-g + restic repositories
-- `BackupRepository` (core) and `BackupRepositoryConditional` (the consumer-side decision driver) CRDs both live
+- The `BackupRepository` CRD is live
 - Prometheus metrics, PrometheusRule alerts, and a Grafana dashboard ship with the chart
 - Per-format validators bundled as separate container images (`arete-validator-walg`, `arete-validator-restic`)
 
@@ -34,7 +34,6 @@ Beyond per-level validation, arete:
 - **Exposes Prometheus metrics**: `arete_validation_runs_total`, `arete_validation_duration_seconds`, `arete_e4_throughput_bytes_per_sec`, `arete_backup_age_seconds`, `arete_inventory_objects`, `arete_inventory_bytes`, `arete_condition_state`
 - **Ships a PrometheusRule** with alerts for unhealthy BRs, stale backups, validation halt, and E4 throughput regression
 - **Ships a Grafana dashboard** consuming all of the above
-- **Optionally drives downstream resources** via `BackupRepositoryConditional` — pick one of several manifests based on observed BR state (e.g., a Postgres cluster bootstraps via recovery vs initdb depending on whether backups exist)
 
 ### Status field provenance
 
@@ -65,7 +64,6 @@ In scope:
 - S3 / S3-compatible backup repositories (MinIO, AWS S3, Ceph RGW, R2, B2, etc.)
 - Format-aware validation for `wal-g` and `restic` today (`barman-cloud` and others extensible)
 - E1–E4 monitoring with Prometheus metrics + Grafana dashboard
-- Conditional materialization of downstream resources via `BackupRepositoryConditional`
 
 Out of scope:
 - Backup creation (delegated to existing tools — cnpg-plugin-wal-g, VolSync, etc.)
@@ -74,7 +72,7 @@ Out of scope:
 - DR drill orchestration (delegated to workflow engines)
 - Non-S3 storage backends
 
-## CRDs
+## CRD
 
 ### `BackupRepository` (cluster-scoped)
 
@@ -132,70 +130,6 @@ NAME   FORMAT  HEALTH  PROBE  REACHABLE  CURRENT  LAST BACKUP  BACKUP SIZE  LAST
 
 A blank cell in `E2`/`E3`/`E4` means that layer isn't enabled for this BR — different from `False` (enabled and failing).
 
-### `BackupRepositoryConditional` (namespace-scoped)
-
-Materializes one of several variant manifests based on the live state of a referenced `BackupRepository`. Each variant is a complete K8s manifest stored in a same-namespace ConfigMap or Secret. arete reads the chosen variant, parses, server-side-applies it with the BRC as `ownerReference`, and tracks state.
-
-```yaml
-apiVersion: arete.arete.io/v1alpha1
-kind: BackupRepositoryConditional
-metadata:
-  name: nextcloud-cnpg-bootstrap
-  namespace: customer
-spec:
-  repositoryRef:
-    name: customer-nextcloud-postgres
-  whenHealthy:
-    manifestRef:
-      configMap:
-        name: nextcloud-cnpg-cluster-recovery
-        key: cluster.yaml
-  whenEmpty:
-    manifestRef:
-      configMap:
-        name: nextcloud-cnpg-cluster-init
-        key: cluster.yaml
-  # whenDegraded omitted → refuse to materialize anything in uncertain states
-status:
-  observedRepositoryState: healthy        # healthy | empty | degraded
-  decided: whenHealthy                    # which slot was applied
-  appliedRef:
-    apiVersion: postgresql.cnpg.io/v1
-    kind: Cluster
-    name: nextcloud-cnpg-main
-    namespace: customer
-  conditions: [BackupRepositoryFound, ManifestSourceFound, ManifestParsed,
-               ChildApplied, Decided]
-```
-
-State derivation:
-- **`empty`** — no successful backup recorded AND `observedInventory.objectCount == 0` (catches fresh tenants unambiguously)
-- **`healthy`** — BR's `Healthy` rollup condition is True
-- **`degraded`** — anything else (broken, in-flight, never-validated)
-
-Stickiness comes for free from the *target system's* immutability rules — e.g., cnpg's `bootstrap.*` field is immutable after Cluster creation, so a state flip after first materialization can't silently flip the bootstrap mode. Surfaced as `ChildApplied=False reason=ImmutableFieldRejected`.
-
-A `BackupRepository` may have zero, one, or many BRCs pointing at it. Repos without any consumer still get continuous validation.
-
-### Authoring variants with Kustomize
-
-Variants are typically authored as standalone YAML files (with full IDE / CRD schema validation) and wrapped into ConfigMaps via Kustomize:
-
-```yaml
-# kustomization.yaml
-configMapGenerator:
-  - name: nextcloud-cnpg-cluster-recovery
-    files:
-      - cluster.yaml=cnpg-cluster-recovery.yaml
-  - name: nextcloud-cnpg-cluster-init
-    files:
-      - cluster.yaml=cnpg-cluster-init.yaml
-generatorOptions:
-  disableNameSuffixHash: true            # stable name for the BRC reference
-```
-
-The BRC reads `data.cluster.yaml` from the rendered CM and applies it.
-
 ## Observability
 
 Every reconcile cycle publishes:
@@ -245,19 +179,15 @@ The value is recorded in `status.lastForcedE4At` once the resulting E4 Job compl
 
 If the `credentialsSecret` referenced by a `BackupRepository` briefly disappears (typically during a tenant-namespace rebuild from a DR drill) the controller does *not* immediately flip the BR to unhealthy. It tolerates a 60-second gap, requeueing every 30s. Beyond that window, `Reachable` flips to `False` (with reason `CredentialsUnavailable`) but `MetadataValid` / `SampledIntegrityValid` / `FullRetrievalCompleted` are preserved at their last known-good values — a credentials gap is an *observability* problem, not evidence the repo data has rotted. Once credentials return and validation runs, conditions refresh through the normal path.
 
-The `BackupRepositoryConditional` controller cooperates with this: when a BR's `Healthy` rollup is `Unknown` (vs definitively `False`) and the BRC has a prior successful decision, the BRC preserves that decision rather than flipping to `whenDegraded` — preventing the recovery path from being torn down by the very disturbance it's recovering from.
-
 ## Design rationale
 
 Summary (full reasoning in the project's ADRs, particularly ADR-022 and ADR-023):
 
 - **S3-only** — focused; constraint enables clean code
-- **Two CRDs** — separates observation (`BackupRepository`) from downstream derivation (`BackupRepositoryConditional`)
 - **Four E-levels of validation** — cheap monitoring (E1, E2) is always on; deep retrieval (E3, E4) is opt-in
 - **Format validators are real binaries shipped by arete** — validation matches restoration; no silent drift between the validator's view and what restore would actually see
 - **Always-latest validator** — doubles as a forward-compatibility canary for producer upgrades
 - **Strict contract** — no escape hatches, no soft-fail tier
-- **BRC variants reference manifests, not embed them** — keeps source files schema-validatable in IDEs; Kustomize bridge handles the wrap
 
 ## Install
 
@@ -291,13 +221,7 @@ spec:
       enable: true
       rules:
         enable: true
-    backupRepositoryConditional:
-      childResourceTargets:                # GVKs the BRC controller may write
-        - apiGroups: ["postgresql.cnpg.io"]
-          resources: ["clusters"]
 ```
-
-Add additional `childResourceTargets` if your BRCs materialize other GVKs.
 
 ## License
 

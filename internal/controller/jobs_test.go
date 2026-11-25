@@ -490,3 +490,26 @@ func TestInventoryDue(t *testing.T) {
 		t.Error("each repository has its own schedule")
 	}
 }
+
+func TestMapSecretToRepositories(t *testing.T) {
+	br := jobTestRepository()
+	other := jobTestRepository()
+	other.Name, other.UID = "other-tenant", types.UID("22222222-2222-2222-2222-222222222222")
+	other.Spec.S3.CredentialsSecret = aretev1alpha1.SecretReference{Name: "creds", Namespace: "elsewhere"}
+	r := jobTestReconciler(t, br, other)
+
+	// The watch delivers metadata only; the mapping must work without the
+	// Secret's contents.
+	meta := &metav1.PartialObjectMetadata{}
+	meta.Name, meta.Namespace = "creds", jobTestNamespace
+
+	got := r.mapSecretToRepositories(context.Background(), meta)
+	if len(got) != 1 || got[0].Name != br.Name {
+		t.Fatalf("expected a request for %q only, got %v", br.Name, got)
+	}
+
+	meta.Name = "unrelated"
+	if got := r.mapSecretToRepositories(context.Background(), meta); len(got) != 0 {
+		t.Fatalf("an unrelated Secret must not trigger anything, got %v", got)
+	}
+}

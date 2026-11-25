@@ -57,8 +57,8 @@ var ErrCredentialsSecretNotFound = errors.New("credentials secret not found")
 
 // credentialsTransientTolerance bounds how long we wait for a missing
 // Secret to reappear before declaring the BR un-Reachable. Exists so a
-// DR drill that briefly destroys the tenant namespace doesn't take down
-// the BR (and via the BRC, all dependent resources). 60s is roughly an
+// DR drill that briefly destroys the tenant namespace doesn't flip the
+// BR's status for a gap of a few seconds. 60s is roughly an
 // order of magnitude longer than the typical Flux re-create window
 // (5-15s) but well below the fastest valid recovery interval. Status
 // conditions are NOT touched within this window — the BR shows last
@@ -176,8 +176,7 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		// Special-case "Secret transiently missing" so a brief gap (a
 		// few seconds during a DR drill where the tenant namespace is
 		// being torn down + recreated) doesn't flip the BR's status to
-		// degraded — which would in turn make every dependent BRC flip
-		// its decision and tear apart the recovery path itself. Any
+		// degraded and alarm on a gap that closes by itself. Any
 		// other credential error (forbidden, malformed, missing keys)
 		// is reported immediately.
 		if errors.Is(err, ErrCredentialsSecretNotFound) {
@@ -1403,10 +1402,9 @@ func rollupAND(cs []metav1.Condition, condTypes ...string) metav1.Condition {
 func (r *BackupRepositoryReconciler) mapSecretToRepositories(
 	ctx context.Context, obj client.Object,
 ) []reconcile.Request {
-	secret, ok := obj.(*corev1.Secret)
-	if !ok {
-		return nil
-	}
+	// obj is metadata only (see SetupWithManager): name and namespace are
+	// all that is needed, and Secret contents are never cached.
+	secret := obj
 	var list aretev1alpha1.BackupRepositoryList
 	if err := r.List(ctx, &list); err != nil {
 		return nil
@@ -1414,7 +1412,7 @@ func (r *BackupRepositoryReconciler) mapSecretToRepositories(
 	var requests []reconcile.Request
 	for i := range list.Items {
 		ref := list.Items[i].Spec.S3.CredentialsSecret
-		if ref.Name == secret.Name && ref.Namespace == secret.Namespace {
+		if ref.Name == secret.GetName() && ref.Namespace == secret.GetNamespace() {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: client.ObjectKeyFromObject(&list.Items[i]),
 			})
@@ -1432,7 +1430,8 @@ func (r *BackupRepositoryReconciler) mapSecretToRepositories(
 //     self-feeding loop that LastProbedAt-on-every-cycle would
 //     otherwise produce.
 //   - Owns()   — Job state changes (created/scheduled/complete/deleted).
-//   - Watches()— Secret create/update/delete via mapSecretToRepositories.
+//   - WatchesMetadata() — Secret create/update/delete via
+//     mapSecretToRepositories (metadata only, no Secret contents).
 //   - Periodic — Result{RequeueAfter: probeInterval} from each Reconcile.
 func (r *BackupRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -1442,7 +1441,10 @@ func (r *BackupRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				forceRevalidatePredicate{},
 			))).
 		Owns(&batchv1.Job{}).
-		Watches(
+		// Metadata only: the watch exists to notice that a credentials
+		// Secret changed, not to read it. A full watch would keep the
+		// contents of every Secret in the cluster in this process's memory.
+		WatchesMetadata(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.mapSecretToRepositories),
 		).
