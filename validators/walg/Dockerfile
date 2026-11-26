@@ -31,7 +31,7 @@ ARG WALG_VERSION=3.0.5
 # binary can't read repos written by older plugin versions.
 FROM ghcr.io/wal-g/cnpg-plugin-wal-g:0.2.2 AS walg-source
 
-FROM ubuntu:22.04
+FROM ubuntu:26.04
 ARG WALG_VERSION
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
