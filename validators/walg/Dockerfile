@@ -29,7 +29,7 @@ ARG WALG_VERSION=3.0.5
 # the data we validate, matching it is the right choice. The forward-
 # compat canary still fires when the plugin bumps wal-g and the new
 # binary can't read repos written by older plugin versions.
-FROM ghcr.io/wal-g/cnpg-plugin-wal-g:0.2.2 AS walg-source
+FROM ghcr.io/wal-g/cnpg-plugin-wal-g:0.3.2 AS walg-source
 
 FROM ubuntu:22.04
 ARG WALG_VERSION
